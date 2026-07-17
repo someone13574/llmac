@@ -10,15 +10,26 @@ constexpr std::uint64_t HALF = WHOLE >> 1;
 constexpr std::uint64_t QUARTER = WHOLE >> 2;
 constexpr std::uint64_t THREE_QUARTERS = QUARTER + HALF;
 
+using Symbol = std::uint32_t;
+
 struct Encoded {
     std::vector<std::uint32_t> buffer;
-    std::size_t bits;
+    std::size_t bits = 0;
 };
 
 Encoded encode(
     std::span<std::uint32_t> seq_probs,
-    std::span<std::uint32_t> seq,
+    std::span<Symbol> seq,
     std::size_t seq_len
+);
+
+using GetProbs = std::vector<std::uint32_t> (*)(std::span<Symbol>);
+
+std::vector<Symbol> decode(
+    std::span<const std::uint32_t> code,
+    std::size_t bits,
+    std::size_t seq_len,
+    GetProbs prob_fn
 );
 
 } // namespace ac

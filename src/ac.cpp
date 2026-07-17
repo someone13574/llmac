@@ -1,18 +1,30 @@
 #include "ac.hpp"
 
 #include <cassert>
+#include <cstddef>
 #include <cstdint>
 #include <numeric>
+#include <span>
 #include <vector>
 
 namespace ac {
 
 struct SymbolRange {
+    Symbol symbol;
     std::uint32_t low;
     std::uint32_t high;
     std::uint32_t total;
 
-    SymbolRange(std::span<std::uint32_t> probs, std::uint32_t symbol) {
+    SymbolRange(
+        Symbol symbol,
+        std::uint32_t low,
+        std::uint32_t high,
+        std::uint32_t total
+    )
+        : symbol(symbol), low(low), high(high), total(total) {}
+
+    SymbolRange(std::span<std::uint32_t> probs, Symbol symbol)
+        : symbol(symbol) {
         assert(symbol < probs.size());
         low = std::accumulate(
             probs.begin(),
@@ -67,7 +79,7 @@ void finalize_encoded(
 
 Encoded encode(
     std::span<std::uint32_t> seq_probs,
-    std::span<std::uint32_t> seq,
+    std::span<Symbol> seq,
     std::size_t seq_len
 ) {
     assert(seq_probs.size() % seq_len == 0);
@@ -87,7 +99,7 @@ Encoded encode(
             seq[idx]
         );
 
-        std::uint64_t range = high - low + 1;
+        std::uint64_t range = static_cast<std::uint64_t>(high) - low + 1;
         high = low
              + static_cast<std::uint32_t>(
                    range * symbol_range.high / symbol_range.total
@@ -125,5 +137,112 @@ Encoded encode(
     finalize_encoded(acc, acc_size, encoded);
     return encoded;
 }
+
+namespace {
+
+class BitReader {
+    std::span<const std::uint32_t> code;
+    std::size_t bits;
+    std::size_t pos = 0;
+
+  public:
+    BitReader(std::span<const std::uint32_t> code, std::size_t bits)
+        : code(code), bits(bits) {}
+
+    std::uint32_t next() {
+        if (pos >= bits) {
+            return 0;
+        }
+
+        std::uint32_t word = code[pos / 32];
+        std::uint32_t bit = (word >> (31 - (pos % 32))) & 1U;
+        pos += 1;
+        return bit;
+    }
+};
+
+} // namespace
+
+SymbolRange find_symbol(
+    std::span<const std::uint32_t> probs,
+    std::uint32_t value,
+    std::uint32_t low,
+    std::uint64_t range
+) {
+    std::uint32_t total =
+        std::accumulate(probs.begin(), probs.end(), std::uint32_t {0});
+    assert(total <= QUARTER);
+
+    std::uint64_t offset = static_cast<std::uint64_t>(value) - low;
+    auto scaled =
+        static_cast<std::uint32_t>(((offset + 1) * total - 1) / range);
+
+    std::uint32_t acc = 0;
+    for (Symbol symbol = 0; symbol < probs.size(); symbol++) {
+        std::uint32_t next = acc + probs[symbol];
+        if (scaled < next) {
+            return {symbol, acc, next, total};
+        }
+        acc = next;
+    }
+
+    assert(false && "code value out of range");
+    return {0, 0, 0, 0};
+}
+
+std::vector<Symbol> decode(
+    std::span<const std::uint32_t> code,
+    std::size_t bits,
+    std::size_t seq_len,
+    GetProbs prob_fn
+) {
+    std::vector<Symbol> seq;
+    seq.reserve(seq_len);
+
+    BitReader reader(code, bits);
+
+    std::uint32_t low = 0;
+    std::uint32_t high = WHOLE - 1;
+
+    std::uint32_t value = 0;
+    for (int idx = 0; idx < 32; idx++) {
+        value = (value << 1) | reader.next();
+    }
+
+    for (std::size_t idx = 0; idx < seq_len; idx++) {
+        std::uint64_t range = static_cast<std::uint64_t>(high) - low + 1;
+        auto probs = prob_fn(seq);
+
+        SymbolRange symbol = find_symbol(probs, value, low, range);
+        seq.push_back(symbol.symbol);
+
+        high = low
+             + static_cast<std::uint32_t>(range * symbol.high / symbol.total)
+             - 1;
+        low =
+            low + static_cast<std::uint32_t>(range * symbol.low / symbol.total);
+
+        while (true) {
+            if (high < HALF) {
+            } else if (low >= HALF) {
+                low -= HALF;
+                high -= HALF;
+                value -= HALF;
+            } else if (low >= QUARTER && high < THREE_QUARTERS) {
+                low -= QUARTER;
+                high -= QUARTER;
+                value -= QUARTER;
+            } else {
+                break;
+            }
+
+            low = low << 1;
+            high = (high << 1) + 1;
+            value = (value << 1) | reader.next();
+        }
+    }
+
+    return seq;
+};
 
 } // namespace ac
