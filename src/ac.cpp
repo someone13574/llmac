@@ -33,20 +33,23 @@ void emit_bit(
     std::uint32_t& pending,
     std::uint32_t pending_bit
 ) {
-    acc = (acc << 1) | bit;
+    while (true) {
+        acc = (acc << 1) | bit;
 
-    if (acc_size == 31) {
-        acc_size = 0;
-        encoded.buffer.push_back(acc);
-        encoded.bits += 32;
-        acc = 0;
-    } else {
-        acc_size += 1;
-    }
+        if (acc_size == 31) {
+            acc_size = 0;
+            encoded.buffer.push_back(acc);
+            encoded.bits += 32;
+            acc = 0;
+        } else {
+            acc_size += 1;
+        }
 
-    if (pending != 0) {
+        if (pending == 0) {
+            break;
+        }
         pending -= 1;
-        emit_bit(acc, acc_size, encoded, pending_bit, pending, pending_bit);
+        bit = pending_bit;
     }
 }
 
