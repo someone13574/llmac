@@ -1,0 +1,36 @@
+---
+BasedOnStyle: LLVM
+AlignAfterOpenBracket: BlockIndent
+AlignArrayOfStructures: Right
+AlignConsecutiveAssignments: {}
+AlignConsecutiveBitFields: {}
+AlignEscapedNewlines: Right
+UseTab: Never
+IndentWidth: 4
+ColumnLimit: 80
+IncludeBlocks: Regroup
+AllowAllArgumentsOnNextLine: false
+AllowAllParametersOfDeclarationOnNextLine: false
+AllowShortFunctionsOnASingleLine: Empty
+BinPackParameters: false
+BinPackArguments: false
+IndentCaseLabels: true
+InsertBraces: true
+InsertNewlineAtEOF: true
+LineEnding: LF
+ReflowComments: true
+PointerAlignment: Left
+AlignOperands: AlignAfterOperator
+BreakBeforeBinaryOperators: NonAssignment
+IncludeCategories:
+  - Regex: ^<.*>
+    Priority: 1
+    CaseSensitive: false
+    SortPriority: 0
+  - Regex: .*
+    Priority: 2
+    CaseSensitive: false
+    SortPriority: 0
+IncludeIsMainRegex: ""
+BreakStringLiterals: false
+SpaceBeforeCpp11BracedList: true

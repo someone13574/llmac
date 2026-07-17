@@ -1,0 +1,14 @@
+---
+Checks: >
+  bugprone-*,
+  modernize-*,
+  performance-*,
+  readability-*,
+  -bugprone-easily-swappable-parameters,
+  -modernize-use-trailing-return-type,
+  -readability-identifier-length,
+  -readability-magic-numbers
+HeaderFilterRegex: '.*'
+ExcludeHeaderFilterRegex: '.*/_deps/.*'
+CheckOptions:
+  readability-function-cognitive-complexity.IgnoreMacros: 'true'
