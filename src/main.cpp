@@ -1,11 +1,13 @@
+#include <cctype>
 #include <charconv>
 #include <common.h>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
+#include <fstream>
 #include <llama.h>
+#include <optional>
 #include <print>
 #include <span>
 #include <string>
@@ -96,7 +98,32 @@ class TokenEvaluator {
     }
 };
 
-int encode_mode(const char* text) {
+std::optional<std::string> read_file(const char* path) {
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file) {
+        std::println(stderr, "error: unable to open file '{}'", path);
+        return std::nullopt;
+    }
+
+    const std::streamoff size = file.tellg();
+    if (size < 0) {
+        std::println(stderr, "error: unable to determine size of '{}'", path);
+        return std::nullopt;
+    }
+
+    std::string content(static_cast<std::size_t>(size), '\0');
+    file.seekg(0);
+    file.read(content.data(), static_cast<std::streamsize>(size));
+    if (file.bad()) {
+        std::println(stderr, "error: failed to read file '{}'", path);
+        return std::nullopt;
+    }
+    content.resize(static_cast<std::size_t>(file.gcount()));
+
+    return content;
+}
+
+int encode_mode(std::string_view text) {
     llama_model* model = load_model();
     if (model == nullptr) {
         return 1;
@@ -106,8 +133,8 @@ int encode_mode(const char* text) {
 
     const int n_tokens = -llama_tokenize(
         vocab,
-        text,
-        static_cast<int>(strlen(text)),
+        text.data(),
+        static_cast<int>(text.size()),
         nullptr,
         0,
         true,
@@ -117,8 +144,8 @@ int encode_mode(const char* text) {
     std::vector<llama_token> tokens(static_cast<std::size_t>(n_tokens));
     if (llama_tokenize(
             vocab,
-            text,
-            static_cast<int>(strlen(text)),
+            text.data(),
+            static_cast<int>(text.size()),
             tokens.data(),
             static_cast<int>(tokens.size()),
             true,
@@ -198,7 +225,7 @@ int encode_mode(const char* text) {
         "{} bits for {} tokens ({} bits of text)",
         encoded.bits,
         seq_len,
-        strlen(text) * 8
+        text.size() * 8
     );
 
     llama_batch_free(batch);
@@ -208,7 +235,15 @@ int encode_mode(const char* text) {
     return 0;
 }
 
-int decode_mode(std::string_view hex) {
+int decode_mode(std::string_view raw) {
+    std::string hex;
+    hex.reserve(raw.size());
+    for (char ch : raw) {
+        if (std::isspace(static_cast<unsigned char>(ch)) == 0) {
+            hex.push_back(ch);
+        }
+    }
+
     if (hex.size() < 24 || hex.size() % 8 != 0) {
         std::println(
             stderr,
@@ -312,19 +347,46 @@ int decode_mode(std::string_view hex) {
 int main(int argc, char** argv) {
     llama_log_set(quiet_log, nullptr);
 
-    if (argc != 3) {
-        std::println(stderr, "usage: llmac <encode|decode> <text|hex>");
+    constexpr std::string_view usage =
+        "usage: llmac <encode|decode> [-f] <text|hex>\n"
+        "  -f, --file    read the text/hex from the file at the given path";
+
+    if (argc < 3 || argc > 4) {
+        std::println(stderr, "{}", usage);
         return 1;
     }
 
     const std::string_view mode = argv[1];
-    if (mode == "encode") {
-        return encode_mode(argv[2]);
-    }
-    if (mode == "decode") {
-        return decode_mode(argv[2]);
+    if (mode != "encode" && mode != "decode") {
+        std::println(stderr, "{}", usage);
+        return 1;
     }
 
-    std::println(stderr, "usage: llmac <encode|decode> <text|hex>");
-    return 1;
+    bool from_file = false;
+    const char* input_arg = argv[2];
+    if (argc == 4) {
+        const std::string_view flag = argv[2];
+        if (flag != "-f" && flag != "--file") {
+            std::println(stderr, "{}", usage);
+            return 1;
+        }
+        from_file = true;
+        input_arg = argv[3];
+    }
+
+    std::string input;
+    if (from_file) {
+        std::optional<std::string> content = read_file(input_arg);
+        if (!content) {
+            return 1;
+        }
+        input = std::move(*content);
+    } else {
+        input = input_arg;
+    }
+
+    if (mode == "encode") {
+        return encode_mode(input);
+    }
+    return decode_mode(input);
 }
