@@ -16,15 +16,15 @@ struct SymbolRange {
     std::uint32_t total;
 
     SymbolRange(
-        Symbol symbol,
-        std::uint32_t low,
-        std::uint32_t high,
-        std::uint32_t total
+        Symbol symbol_,
+        std::uint32_t low_,
+        std::uint32_t high_,
+        std::uint32_t total_
     )
-        : symbol(symbol), low(low), high(high), total(total) {}
+        : symbol(symbol_), low(low_), high(high_), total(total_) {}
 
-    SymbolRange(std::span<std::uint32_t> probs, Symbol symbol)
-        : symbol(symbol) {
+    SymbolRange(std::span<std::uint32_t> probs, Symbol symbol_)
+        : symbol(symbol_) {
         assert(symbol < probs.size());
         low = std::accumulate(
             probs.begin(),
@@ -146,8 +146,8 @@ class BitReader {
     std::size_t pos = 0;
 
   public:
-    BitReader(std::span<const std::uint32_t> code, std::size_t bits)
-        : code(code), bits(bits) {}
+    BitReader(std::span<const std::uint32_t> code_, std::size_t bits_)
+        : code(code_), bits(bits_) {}
 
     std::uint32_t next() {
         if (pos >= bits) {

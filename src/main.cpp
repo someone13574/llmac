@@ -19,10 +19,13 @@
 
 namespace {
 
-constexpr const char* MODEL_PATH =
-    "models/HuggingFaceTB.SmolLM3-3B-Base.Q4_K_M.gguf";
+constexpr const char* MODEL_PATH = "models/Qwen3-0.6B-Q4_K_M.gguf";
 
-void quiet_log(ggml_log_level level, const char* text, void* /*user_data*/) {
+void quiet_log(
+    ggml_log_level level,
+    const char* text,
+    [[maybe_unused]] void* user_data
+) {
     static ggml_log_level last_level = GGML_LOG_LEVEL_INFO;
     if (level != GGML_LOG_LEVEL_CONT) {
         last_level = level;
@@ -123,6 +126,58 @@ std::optional<std::string> read_file(const char* path) {
     return content;
 }
 
+bool append_model_freqs(
+    llama_model* model,
+    std::span<const llama_token> tokens,
+    std::size_t n_vocab,
+    std::vector<std::uint32_t>& seq_probs
+) {
+    const int n_tokens = static_cast<int>(tokens.size());
+    llama_context_params ctx_params = context_params(n_tokens, n_tokens);
+    llama_context* ctx = llama_init_from_model(model, ctx_params);
+    if (ctx == nullptr) {
+        std::println(stderr, "error: failed to create the context");
+        return false;
+    }
+
+    llama_batch batch = llama_batch_init(n_tokens, 0, 1);
+    batch.n_tokens = n_tokens;
+    for (int idx = 0; idx < n_tokens; idx++) {
+        batch.token[idx] = tokens[static_cast<std::size_t>(idx)];
+        batch.pos[idx] = idx;
+        batch.n_seq_id[idx] = 1;
+        batch.seq_id[idx][0] = 0;
+        batch.logits[idx] = idx + 1 < n_tokens ? 1 : 0;
+    }
+
+    bool ok = llama_decode(ctx, batch) == 0;
+    if (!ok) {
+        std::println(stderr, "error/warn: failed to decode");
+    }
+
+    for (std::size_t idx = 1; ok && idx < tokens.size(); idx++) {
+        const float* logits =
+            llama_get_logits_ith(ctx, static_cast<int>(idx - 1));
+        if (logits == nullptr) {
+            std::println(
+                stderr,
+                "error: failed to get logits at position {}",
+                idx - 1
+            );
+            ok = false;
+            break;
+        }
+
+        std::vector<std::uint32_t> freqs =
+            quantize_probs(std::span(logits, n_vocab));
+        seq_probs.insert(seq_probs.end(), freqs.begin(), freqs.end());
+    }
+
+    llama_batch_free(batch);
+    llama_free(ctx);
+    return ok;
+}
+
 int encode_mode(std::string_view text) {
     llama_model* model = load_model();
     if (model == nullptr) {
@@ -142,94 +197,70 @@ int encode_mode(std::string_view text) {
     );
 
     std::vector<llama_token> tokens(static_cast<std::size_t>(n_tokens));
-    if (llama_tokenize(
-            vocab,
-            text.data(),
-            static_cast<int>(text.size()),
-            tokens.data(),
-            static_cast<int>(tokens.size()),
-            true,
-            true
-        )
-        < 0) {
+    if (n_tokens > 0
+        && llama_tokenize(
+               vocab,
+               text.data(),
+               static_cast<int>(text.size()),
+               tokens.data(),
+               static_cast<int>(tokens.size()),
+               true,
+               true
+           ) < 0) {
         std::println(stderr, "error: unable to tokenize text");
-        return 1;
-    }
-
-    if (n_tokens < 2) {
-        std::println(stderr, "error: need at least two tokens to encode");
-        return 1;
-    }
-
-    llama_context_params ctx_params = context_params(n_tokens, n_tokens);
-
-    llama_context* ctx = llama_init_from_model(model, ctx_params);
-    if (ctx == nullptr) {
-        std::println(stderr, "error: failed to create the context");
-        return 1;
-    }
-
-    llama_batch batch = llama_batch_init(n_tokens, 0, 1);
-    batch.n_tokens = n_tokens;
-    for (int idx = 0; idx < n_tokens; ++idx) {
-        batch.token[idx] = tokens[static_cast<std::size_t>(idx)];
-        batch.pos[idx] = idx;
-        batch.n_seq_id[idx] = 1;
-        batch.seq_id[idx][0] = 0;
-        batch.logits[idx] = idx + 1 < n_tokens ? 1 : 0;
-    }
-
-    int result = llama_decode(ctx, batch);
-    if (result != 0) {
-        std::println(stderr, "error/warn: failed to decode {}", result);
+        llama_model_free(model);
         return 1;
     }
 
     const auto n_vocab = static_cast<std::size_t>(llama_vocab_n_tokens(vocab));
-    const auto seq_len = static_cast<std::size_t>(n_tokens - 1);
 
-    std::vector<std::uint32_t> seq_probs;
-    seq_probs.reserve(seq_len * n_vocab);
-    std::vector<ac::Symbol> seq(seq_len);
+    const bool add_bos = llama_vocab_get_add_bos(vocab);
+    const std::size_t start = (add_bos && n_tokens >= 1) ? 1 : 0;
+    const auto seq_len = static_cast<std::size_t>(n_tokens) - start;
 
-    for (std::size_t idx = 0; idx < seq_len; ++idx) {
-        const float* logits = llama_get_logits_ith(ctx, static_cast<int>(idx));
-        if (logits == nullptr) {
-            std::println(
-                stderr,
-                "error: failed to get logits at position {}",
-                idx
-            );
+    ac::Encoded encoded;
+    if (seq_len > 0) {
+        std::vector<std::uint32_t> seq_probs;
+        seq_probs.reserve(seq_len * n_vocab);
+        std::vector<ac::Symbol> seq(seq_len);
+        for (std::size_t idx = 0; idx < seq_len; idx++) {
+            seq[idx] = static_cast<ac::Symbol>(tokens[start + idx]);
+        }
+
+        if (start == 0) {
+            std::vector<std::uint32_t> uniform = uniform_freqs(n_vocab);
+            seq_probs.insert(seq_probs.end(), uniform.begin(), uniform.end());
+        }
+
+        if (tokens.size() >= 2
+            && !append_model_freqs(model, tokens, n_vocab, seq_probs)) {
+            llama_model_free(model);
             return 1;
         }
 
-        std::vector<std::uint32_t> freqs =
-            quantize_probs(std::span(logits, n_vocab));
-        seq_probs.insert(seq_probs.end(), freqs.begin(), freqs.end());
-        seq[idx] = static_cast<ac::Symbol>(tokens[idx + 1]);
+        encoded = ac::encode(seq_probs, seq, seq_len);
     }
 
-    ac::Encoded encoded = ac::encode(seq_probs, seq, seq_len);
-
-    std::print(
-        "{:08x}{:08x}",
-        static_cast<std::uint32_t>(seq_len),
-        static_cast<std::uint32_t>(tokens[0])
-    );
-    for (std::uint32_t word : encoded.buffer) {
-        std::print("{:08x}", word);
+    std::print("{:08x}", static_cast<std::uint32_t>(seq_len));
+    const std::size_t payload_nibbles = (encoded.bits + 3) / 4;
+    for (std::size_t nibble = 0; nibble < payload_nibbles; nibble++) {
+        const std::uint32_t word = encoded.buffer[nibble / 8];
+        const unsigned shift = 28 - (4 * (nibble % 8));
+        std::print("{:x}", (word >> shift) & 0xFU);
     }
     std::println("");
     std::println(
         stderr,
-        "{} bits for {} tokens ({} bits of text)",
+        "{} bits for {} tokens ({} bits of text, {:.2f}% compression)",
         encoded.bits,
         seq_len,
-        text.size() * 8
+        text.size() * 8,
+        100.0
+            * (1.0
+               - static_cast<double>(encoded.bits)
+                     / static_cast<double>(text.size() * 8))
     );
 
-    llama_batch_free(batch);
-    llama_free(ctx);
     llama_model_free(model);
 
     return 0;
@@ -244,32 +275,43 @@ int decode_mode(std::string_view raw) {
         }
     }
 
-    if (hex.size() < 24 || hex.size() % 8 != 0) {
-        std::println(
-            stderr,
-            "error: hex input must be a multiple of 8 hex digits"
-        );
+    auto parse_hex = [&](std::size_t off, std::size_t len, std::uint32_t& out) {
+        const char* first = hex.data() + off;
+        auto [ptr, err_code] = std::from_chars(first, first + len, out, 16);
+        return err_code == std::errc {} && ptr == first + len;
+    };
+
+    constexpr std::size_t header_nibbles = 8;
+    std::uint32_t seq_len_word = 0;
+    if (hex.size() < header_nibbles
+        || !parse_hex(0, header_nibbles, seq_len_word)) {
+        std::println(stderr, "error: invalid hex input");
+        return 1;
+    }
+    const auto seq_len = static_cast<std::size_t>(seq_len_word);
+
+    const bool bad_size = seq_len == 0 ? hex.size() != header_nibbles
+                                       : hex.size() <= header_nibbles;
+    if (bad_size) {
+        std::println(stderr, "error: malformed hex input");
         return 1;
     }
 
-    std::vector<std::uint32_t> words(hex.size() / 8);
-    for (std::size_t idx = 0; idx < words.size(); idx++) {
-        const char* first = hex.data() + (idx * 8);
-        auto [ptr, ec] = std::from_chars(first, first + 8, words[idx], 16);
-        if (ec != std::errc {} || ptr != first + 8) {
+    const std::size_t payload_nibbles = hex.size() - header_nibbles;
+    std::vector<std::uint32_t> code((payload_nibbles + 7) / 8, 0);
+    for (std::size_t nibble = 0; nibble < payload_nibbles; nibble++) {
+        std::uint32_t digit = 0;
+        if (!parse_hex(header_nibbles + nibble, 1, digit)) {
             std::println(stderr, "error: invalid hex input");
             return 1;
         }
+        code[nibble / 8] |= digit << (28 - (4 * (nibble % 8)));
     }
 
-    const auto seq_len = static_cast<std::size_t>(words[0]);
     if (seq_len == 0) {
-        std::println(stderr, "error: nothing to decode");
-        return 1;
+        std::println("");
+        return 0;
     }
-
-    const auto first_token = static_cast<llama_token>(words[1]);
-    std::span<const std::uint32_t> code = std::span(words).subspan(2);
 
     llama_model* model = load_model();
     if (model == nullptr) {
@@ -277,6 +319,9 @@ int decode_mode(std::string_view raw) {
     }
 
     const llama_vocab* vocab = llama_model_get_vocab(model);
+    const auto n_vocab = static_cast<std::size_t>(llama_vocab_n_tokens(vocab));
+    const bool add_bos = llama_vocab_get_add_bos(vocab);
+    const llama_token bos = llama_vocab_bos(vocab);
 
     llama_context_params ctx_params =
         context_params(static_cast<int>(seq_len) + 1, 1);
@@ -284,26 +329,24 @@ int decode_mode(std::string_view raw) {
     llama_context* ctx = llama_init_from_model(model, ctx_params);
     if (ctx == nullptr) {
         std::println(stderr, "error: failed to create the context");
+        llama_model_free(model);
         return 1;
     }
 
     TokenEvaluator eval(ctx, vocab);
     ac::GetProbs prob_fn = [&](std::span<const ac::Symbol> seq) {
-        return eval.append(
-            seq.empty() ? first_token : static_cast<llama_token>(seq.back())
-        );
+        if (seq.empty()) {
+            return add_bos ? eval.append(bos) : uniform_freqs(n_vocab);
+        }
+        return eval.append(static_cast<llama_token>(seq.back()));
     };
 
-    auto emit_token = [&](llama_token token) {
-        // special=false drops the auto-added BOS (rendered as an empty piece)
-        // and matches the batch detokenize's remove_special behaviour.
-        std::print("{}", common_token_to_piece(ctx, token, false));
-        std::fflush(stdout);
-    };
-
-    emit_token(first_token);
     ac::OnSymbol on_symbol = [&](ac::Symbol symbol) {
-        emit_token(static_cast<llama_token>(symbol));
+        std::print(
+            "{}",
+            common_token_to_piece(ctx, static_cast<llama_token>(symbol), true)
+        );
+        std::fflush(stdout);
     };
 
     ac::decode(code, code.size() * 32, seq_len, prob_fn, on_symbol);

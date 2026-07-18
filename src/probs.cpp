@@ -50,6 +50,10 @@ double det_exp2(double x) {
 
 } // namespace
 
+std::vector<std::uint32_t> uniform_freqs(std::size_t count) {
+    return std::vector<std::uint32_t>(count, 1);
+}
+
 std::vector<std::uint32_t> quantize_probs(std::span<const float> logits) {
     float max_logit = logits[0];
     for (float logit : logits) {

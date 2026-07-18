@@ -7,9 +7,9 @@
 namespace ac {
 
 constexpr std::uint64_t WHOLE = UINT64_C(1) << 32;
-constexpr std::uint64_t HALF = WHOLE >> 1;
-constexpr std::uint64_t QUARTER = WHOLE >> 2;
-constexpr std::uint64_t THREE_QUARTERS = QUARTER + HALF;
+constexpr std::uint32_t HALF = UINT32_C(1) << 31;
+constexpr std::uint32_t QUARTER = HALF >> 1;
+constexpr std::uint32_t THREE_QUARTERS = QUARTER + HALF;
 
 using Symbol = std::uint32_t;
 
