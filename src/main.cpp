@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "ac.hpp"
+#include "canon.hpp"
 #include "probs.hpp"
 
 namespace {
@@ -184,45 +185,13 @@ std::optional<std::string> read_file(const char* path) {
     return content;
 }
 
-std::optional<std::vector<llama_token>>
-tokenize_text(const llama_vocab* vocab, std::string_view text) {
-    const int needed = -llama_tokenize(
-        vocab,
-        text.data(),
-        static_cast<int>(text.size()),
-        nullptr,
-        0,
-        true,
-        false
-    );
-    if (needed <= 0) {
-        return std::vector<llama_token> {};
-    }
-
-    std::vector<llama_token> tokens(static_cast<std::size_t>(needed));
-    const int written = llama_tokenize(
-        vocab,
-        text.data(),
-        static_cast<int>(text.size()),
-        tokens.data(),
-        static_cast<int>(tokens.size()),
-        true,
-        false
-    );
-    if (written < 0) {
-        std::println(stderr, "error: unable to tokenize text");
-        return std::nullopt;
-    }
-    tokens.resize(static_cast<std::size_t>(written));
-    return tokens;
-}
-
 ac::Encoded run_encode(
     llama_model* model,
     std::span<const llama_token> feed,
     const Perm* perm,
     bool suppress_eos,
-    bool append_eos
+    bool append_eos,
+    bool canonical
 ) {
     const llama_vocab* vocab = llama_model_get_vocab(model);
     const auto n_vocab = static_cast<std::size_t>(llama_vocab_n_tokens(vocab));
@@ -257,29 +226,41 @@ ac::Encoded run_encode(
         eval.emplace(ctx, vocab);
     }
 
+    std::optional<Canonical> canon;
+    if (canonical) {
+        canon.emplace(vocab);
+    }
+
     std::deque<std::vector<std::uint32_t>> pending;
     if (start == 0) {
-        pending.push_back(
-            symbol_row(uniform_freqs(n_vocab), perm, eos, suppress_eos)
-        );
+        pending.push_back(uniform_freqs(n_vocab));
     }
     std::size_t fed = 0;
+    std::size_t step = 0;
     ac::GetProbs prob_fn = [&](std::span<const ac::Symbol>) {
         while (pending.empty()) {
             const std::size_t take = std::min(CHUNK, feed.size() - fed);
             eval->feed(
                 feed.subspan(fed, take),
                 [&](std::vector<std::uint32_t> row) {
-                    pending.push_back(
-                        symbol_row(std::move(row), perm, eos, suppress_eos)
-                    );
+                    pending.push_back(std::move(row));
                 }
             );
             fed += take;
         }
         std::vector<std::uint32_t> row = std::move(pending.front());
         pending.pop_front();
-        return row;
+        if (canon) {
+            if (step > 0) {
+                canon->push(feed[start + step - 1]);
+            }
+            mask_row(
+                row,
+                canonical_allow(row, *canon, static_cast<llama_token>(eos))
+            );
+        }
+        step++;
+        return symbol_row(std::move(row), perm, eos, suppress_eos);
     };
 
     ac::Encoded encoded = ac::encode(seq, prob_fn);
@@ -324,8 +305,13 @@ Decoded run_decode(
         eval.feed(std::span(&token, 1), [&](std::vector<std::uint32_t> freqs) {
             row = std::move(freqs);
         });
-        return symbol_row(std::move(row), perm, eos, false);
+        return row;
     };
+
+    std::optional<Canonical> canon;
+    if (stego) {
+        canon.emplace(vocab);
+    }
 
     bool drained = false;
     std::size_t pad_tokens = 0;
@@ -336,23 +322,31 @@ Decoded run_decode(
     })
                           : ac::PadFn {};
 
-    auto first_row = [&] {
-        return add_bos ? next_row(bos)
-                       : symbol_row(uniform_freqs(n_vocab), perm, eos, false);
-    };
     ac::GetProbs prob_fn = [&](std::span<const ac::Symbol> seq) {
-        std::vector<std::uint32_t> row =
-            seq.empty() ? first_row()
-                        : next_row(
-                              static_cast<llama_token>(
-                                  symbol_to_token(perm, seq.back())
-                              )
-                          );
+        std::vector<std::uint32_t> row;
+        if (seq.empty()) {
+            row = add_bos ? next_row(bos) : uniform_freqs(n_vocab);
+        } else {
+            const auto prev =
+                static_cast<llama_token>(symbol_to_token(perm, seq.back()));
+            if (canon) {
+                canon->push(prev);
+            }
+            row = next_row(prev);
+        }
+        if (canon) {
+            mask_row(
+                row,
+                canonical_allow(row, *canon, static_cast<llama_token>(eos))
+            );
+        }
+        std::vector<std::uint32_t> out =
+            symbol_row(std::move(row), perm, eos, false);
         if (stego) {
-            shape_eos(row, stop, drained, pad_tokens);
+            shape_eos(out, stop, drained, pad_tokens);
             pad_tokens += drained ? 1 : 0;
         }
-        return row;
+        return out;
     };
 
     Decoded result;
@@ -615,14 +609,40 @@ int stego_encode_mode(std::string_view secret) {
         tokenize_text(vocab, secret);
     if (secret_tokens) {
         ac::Encoded code =
-            run_encode(model, *secret_tokens, nullptr, false, true);
-        Decoded cover =
-            run_decode(model, code.buffer, code.bits, &perm, true, false, false);
+            run_encode(model, *secret_tokens, nullptr, false, true, false);
+        Decoded cover = run_decode(
+            model,
+            code.buffer,
+            code.bits,
+            &perm,
+            true,
+            false,
+            false
+        );
+
+        const bool add_bos = llama_vocab_get_add_bos(vocab);
+        std::optional<std::vector<llama_token>> recheck =
+            tokenize_text(vocab, cover.text);
+        const std::size_t rstart =
+            (recheck && add_bos && !recheck->empty()) ? 1 : 0;
+        if (!recheck
+            || !std::equal(
+                recheck->begin() + static_cast<std::ptrdiff_t>(rstart),
+                recheck->end(),
+                cover.tokens.begin(),
+                cover.tokens.end()
+            )) {
+            std::println(
+                stderr,
+                "error: cover is not canonically re-tokenizable"
+            );
+            llama_model_free(model);
+            return 1;
+        }
 
         std::print("```\n{}\n```\n", cover.text);
         std::fflush(stdout);
 
-        const bool add_bos = llama_vocab_get_add_bos(vocab);
         const std::size_t start = (add_bos && !secret_tokens->empty()) ? 1 : 0;
         std::println(
             stderr,
@@ -638,20 +658,7 @@ int stego_encode_mode(std::string_view secret) {
     return status;
 }
 
-std::string_view strip_code_fence(std::string_view text) {
-    if (!text.starts_with("```")) {
-        return text;
-    }
-    const std::size_t after_open = text.find('\n');
-    if (after_open == std::string_view::npos) {
-        return text;
-    }
-    std::string_view body = text.substr(after_open + 1);
-    const std::size_t close = body.rfind("\n```");
-    return close == std::string_view::npos ? body : body.substr(0, close);
-}
-
-int stego_decode_mode(std::string_view raw_cover) {
+int stego_decode_mode(std::string_view cover) {
     llama_model* model = load_model();
     if (model == nullptr) {
         return 1;
@@ -666,12 +673,12 @@ int stego_decode_mode(std::string_view raw_cover) {
     const Perm perm =
         Perm::shuffle(static_cast<std::size_t>(llama_vocab_n_tokens(vocab)));
 
-    const std::string_view cover = strip_code_fence(raw_cover);
     int status = 1;
     std::optional<std::vector<llama_token>> cover_tokens =
         tokenize_text(vocab, cover);
     if (cover_tokens) {
-        ac::Encoded code = run_encode(model, *cover_tokens, &perm, true, false);
+        ac::Encoded code =
+            run_encode(model, *cover_tokens, &perm, true, false, true);
         run_decode(model, code.buffer, code.bits, nullptr, false, true, true);
         status = 0;
     }
