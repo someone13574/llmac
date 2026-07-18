@@ -1,4 +1,5 @@
 #include <charconv>
+#include <common.h>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -19,6 +20,16 @@ namespace {
 constexpr const char* MODEL_PATH =
     "models/HuggingFaceTB.SmolLM3-3B-Base.Q4_K_M.gguf";
 
+void quiet_log(ggml_log_level level, const char* text, void* /*user_data*/) {
+    static ggml_log_level last_level = GGML_LOG_LEVEL_INFO;
+    if (level != GGML_LOG_LEVEL_CONT) {
+        last_level = level;
+    }
+    if (last_level >= GGML_LOG_LEVEL_WARN) {
+        std::fputs(text, stderr);
+    }
+}
+
 llama_model* load_model() {
     llama_model_params model_params = llama_model_default_params();
     llama_model* model = llama_model_load_from_file(MODEL_PATH, model_params);
@@ -33,6 +44,8 @@ llama_context_params context_params(int n_tokens, int n_batch) {
     ctx_params.n_ctx = static_cast<std::uint32_t>(n_tokens);
     ctx_params.n_batch = static_cast<std::uint32_t>(n_batch);
     ctx_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    ctx_params.n_threads = common_cpu_get_num_math();
+    ctx_params.n_threads_batch = common_cpu_get_num_math();
     return ctx_params;
 }
 
@@ -297,6 +310,8 @@ int decode_mode(std::string_view hex) {
 } // namespace
 
 int main(int argc, char** argv) {
+    llama_log_set(quiet_log, nullptr);
+
     if (argc != 3) {
         std::println(stderr, "usage: llmac <encode|decode> <text|hex>");
         return 1;
