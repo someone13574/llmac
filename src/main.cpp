@@ -676,6 +676,8 @@ int stego_encode_mode(std::string_view secret) {
     if (secret_tokens) {
         ac::Encoded code =
             run_encode(model, *secret_tokens, {}, nullptr, false, true, false);
+        std::print("```\n");
+        std::fflush(stdout);
         Decoded cover = run_decode(
             model,
             code.buffer,
@@ -684,8 +686,10 @@ int stego_encode_mode(std::string_view secret) {
             &perm,
             true,
             false,
-            false
+            true
         );
+        std::print("\n```\n");
+        std::fflush(stdout);
 
         const bool add_bos = llama_vocab_get_add_bos(vocab);
         std::optional<std::vector<llama_token>> recheck =
@@ -706,9 +710,6 @@ int stego_encode_mode(std::string_view secret) {
             llama_model_free(model);
             return 1;
         }
-
-        std::print("```\n{}\n```\n", cover.text);
-        std::fflush(stdout);
 
         const std::size_t start = (add_bos && !secret_tokens->empty()) ? 1 : 0;
         std::println(
