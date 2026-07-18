@@ -77,14 +77,7 @@ void finalize_encoded(
     }
 }
 
-Encoded encode(
-    std::span<std::uint32_t> seq_probs,
-    std::span<Symbol> seq,
-    std::size_t seq_len
-) {
-    assert(seq_probs.size() % seq_len == 0);
-    size_t num_symbols = seq_probs.size() / seq_len;
-
+Encoded encode(std::span<const Symbol> seq, const GetProbs& prob_fn) {
     std::uint32_t low = 0;
     std::uint32_t high = WHOLE - 1;
 
@@ -93,11 +86,9 @@ Encoded encode(
     Encoded encoded;
 
     uint32_t pending = 0;
-    for (std::size_t idx = 0; idx < seq_len; idx++) {
-        SymbolRange symbol_range = SymbolRange(
-            seq_probs.subspan(idx * num_symbols, num_symbols),
-            seq[idx]
-        );
+    for (std::size_t idx = 0; idx < seq.size(); idx++) {
+        std::vector<std::uint32_t> probs = prob_fn(seq.first(idx));
+        SymbolRange symbol_range = SymbolRange(probs, seq[idx]);
 
         std::uint64_t range = static_cast<std::uint64_t>(high) - low + 1;
         high = low
@@ -193,12 +184,11 @@ SymbolRange find_symbol(
 std::vector<Symbol> decode(
     std::span<const std::uint32_t> code,
     std::size_t bits,
-    std::size_t seq_len,
+    Symbol stop,
     const GetProbs& prob_fn,
     const OnSymbol& on_symbol
 ) {
     std::vector<Symbol> seq;
-    seq.reserve(seq_len);
 
     BitReader reader(code, bits);
 
@@ -210,11 +200,14 @@ std::vector<Symbol> decode(
         value = (value << 1) | reader.next();
     }
 
-    for (std::size_t idx = 0; idx < seq_len; idx++) {
+    while (true) {
         std::uint64_t range = static_cast<std::uint64_t>(high) - low + 1;
         auto probs = prob_fn(seq);
 
         SymbolRange symbol = find_symbol(probs, value, low, range);
+        if (symbol.symbol == stop) {
+            break;
+        }
         seq.push_back(symbol.symbol);
         if (on_symbol) {
             on_symbol(symbol.symbol);

@@ -18,21 +18,17 @@ struct Encoded {
     std::size_t bits = 0;
 };
 
-Encoded encode(
-    std::span<std::uint32_t> seq_probs,
-    std::span<Symbol> seq,
-    std::size_t seq_len
-);
-
 using GetProbs =
     std::function<std::vector<std::uint32_t>(std::span<const Symbol>)>;
 
 using OnSymbol = std::function<void(Symbol)>;
 
+Encoded encode(std::span<const Symbol> seq, const GetProbs& prob_fn);
+
 std::vector<Symbol> decode(
     std::span<const std::uint32_t> code,
     std::size_t bits,
-    std::size_t seq_len,
+    Symbol stop,
     const GetProbs& prob_fn,
     const OnSymbol& on_symbol
 );
