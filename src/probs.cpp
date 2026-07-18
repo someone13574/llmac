@@ -53,6 +53,7 @@ double det_exp2(double x) {
 constexpr std::uint32_t SHUFFLE_SEED = 0x5713'9A0BU;
 constexpr std::size_t STEGO_MARGIN = 16;
 constexpr std::size_t STEGO_RAMP = 48;
+constexpr double STEGO_TOP_P = 0.95;
 
 void raise_eos(
     std::vector<std::uint32_t>& probs,
@@ -193,4 +194,40 @@ void shape_eos(
         static_cast<std::uint64_t>(ac::QUARTER) * step / STEGO_RAMP
     ));
     raise_eos(probs, stop, target);
+}
+
+void top_p_filter(std::vector<std::uint32_t>& probs, ac::Symbol eos) {
+    std::uint64_t total = 0;
+    for (ac::Symbol symbol = 0; symbol < probs.size(); symbol++) {
+        if (symbol != eos) {
+            total += probs[symbol];
+        }
+    }
+    if (total == 0) {
+        return;
+    }
+
+    std::vector<ac::Symbol> order;
+    for (ac::Symbol symbol = 0; symbol < probs.size(); symbol++) {
+        if (symbol != eos && probs[symbol] != 0) {
+            order.push_back(symbol);
+        }
+    }
+    std::ranges::sort(order, [&](ac::Symbol lhs, ac::Symbol rhs) {
+        return probs[lhs] != probs[rhs] ? probs[lhs] > probs[rhs] : lhs < rhs;
+    });
+
+    const double limit = STEGO_TOP_P * static_cast<double>(total);
+    std::uint64_t cumulative = 0;
+    std::size_t keep = 0;
+    while (keep < order.size()) {
+        cumulative += probs[order[keep]];
+        keep++;
+        if (static_cast<double>(cumulative) >= limit) {
+            break;
+        }
+    }
+    for (std::size_t idx = keep; idx < order.size(); idx++) {
+        probs[order[idx]] = 0;
+    }
 }

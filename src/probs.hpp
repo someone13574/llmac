@@ -35,3 +35,5 @@ void shape_eos(
     bool drained,
     std::size_t pad
 );
+
+void top_p_filter(std::vector<std::uint32_t>& probs, ac::Symbol eos);

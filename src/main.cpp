@@ -305,6 +305,7 @@ ac::Encoded run_encode(
                 row,
                 canonical_allow(row, *canon, static_cast<llama_token>(eos))
             );
+            top_p_filter(row, eos);
         }
         step++;
         return symbol_row(std::move(row), perm, eos, suppress_eos);
@@ -404,6 +405,7 @@ Decoded run_decode(
                 row,
                 canonical_allow(row, *canon, static_cast<llama_token>(eos))
             );
+            top_p_filter(row, eos);
         }
         std::vector<std::uint32_t> out =
             symbol_row(std::move(row), perm, eos, false);
