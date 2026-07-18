@@ -1,5 +1,6 @@
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <span>
 #include <vector>
 
@@ -23,13 +24,14 @@ Encoded encode(
     std::size_t seq_len
 );
 
-using GetProbs = std::vector<std::uint32_t> (*)(std::span<Symbol>);
+using GetProbs =
+    std::function<std::vector<std::uint32_t>(std::span<const Symbol>)>;
 
 std::vector<Symbol> decode(
     std::span<const std::uint32_t> code,
     std::size_t bits,
     std::size_t seq_len,
-    GetProbs prob_fn
+    const GetProbs& prob_fn
 );
 
 } // namespace ac

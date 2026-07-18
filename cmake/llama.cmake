@@ -11,6 +11,9 @@ set(LLAMA_BUILD_APP      OFF CACHE BOOL "" FORCE)
 set(LLAMA_CURL           OFF CACHE BOOL "" FORCE)
 set(LLAMA_OPENSSL        OFF CACHE BOOL "" FORCE)
 
+set(GGML_CPU_REPACK      OFF CACHE BOOL "" FORCE)
+set(GGML_LLAMAFILE       OFF CACHE BOOL "" FORCE)
+
 FetchContent_Declare(
     llama
     GIT_REPOSITORY https://github.com/ggml-org/llama.cpp.git
