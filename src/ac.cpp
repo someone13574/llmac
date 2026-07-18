@@ -194,7 +194,8 @@ std::vector<Symbol> decode(
     std::span<const std::uint32_t> code,
     std::size_t bits,
     std::size_t seq_len,
-    const GetProbs& prob_fn
+    const GetProbs& prob_fn,
+    const OnSymbol& on_symbol
 ) {
     std::vector<Symbol> seq;
     seq.reserve(seq_len);
@@ -215,6 +216,9 @@ std::vector<Symbol> decode(
 
         SymbolRange symbol = find_symbol(probs, value, low, range);
         seq.push_back(symbol.symbol);
+        if (on_symbol) {
+            on_symbol(symbol.symbol);
+        }
 
         high = low
              + static_cast<std::uint32_t>(range * symbol.high / symbol.total)

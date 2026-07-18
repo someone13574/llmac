@@ -294,47 +294,21 @@ int decode_mode(std::string_view raw) {
         );
     };
 
-    std::vector<ac::Symbol> seq =
-        ac::decode(code, code.size() * 32, seq_len, prob_fn);
+    auto emit_token = [&](llama_token token) {
+        // special=false drops the auto-added BOS (rendered as an empty piece)
+        // and matches the batch detokenize's remove_special behaviour.
+        std::print("{}", common_token_to_piece(ctx, token, false));
+        std::fflush(stdout);
+    };
 
-    std::vector<llama_token> tokens;
-    tokens.reserve(seq_len + 1);
-    tokens.push_back(first_token);
-    for (ac::Symbol symbol : seq) {
-        tokens.push_back(static_cast<llama_token>(symbol));
-    }
+    emit_token(first_token);
+    ac::OnSymbol on_symbol = [&](ac::Symbol symbol) {
+        emit_token(static_cast<llama_token>(symbol));
+    };
 
-    const std::int32_t needed = -llama_detokenize(
-        vocab,
-        tokens.data(),
-        static_cast<std::int32_t>(tokens.size()),
-        nullptr,
-        0,
-        true,
-        true
-    );
-    if (needed < 0) {
-        std::println(stderr, "error: failed to detokenize");
-        return 1;
-    }
+    ac::decode(code, code.size() * 32, seq_len, prob_fn, on_symbol);
 
-    std::string text(static_cast<std::size_t>(needed), '\0');
-    const std::int32_t written = llama_detokenize(
-        vocab,
-        tokens.data(),
-        static_cast<std::int32_t>(tokens.size()),
-        text.data(),
-        needed,
-        true,
-        true
-    );
-    if (written < 0) {
-        std::println(stderr, "error: failed to detokenize");
-        return 1;
-    }
-    text.resize(static_cast<std::size_t>(written));
-
-    std::println("{}", text);
+    std::println("");
 
     llama_free(ctx);
     llama_model_free(model);

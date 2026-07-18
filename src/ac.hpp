@@ -27,11 +27,14 @@ Encoded encode(
 using GetProbs =
     std::function<std::vector<std::uint32_t>(std::span<const Symbol>)>;
 
+using OnSymbol = std::function<void(Symbol)>;
+
 std::vector<Symbol> decode(
     std::span<const std::uint32_t> code,
     std::size_t bits,
     std::size_t seq_len,
-    const GetProbs& prob_fn
+    const GetProbs& prob_fn,
+    const OnSymbol& on_symbol
 );
 
 } // namespace ac
