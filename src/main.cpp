@@ -300,7 +300,8 @@ Decoded run_decode(
     std::size_t bits,
     const Perm* perm,
     bool stego,
-    bool render_special
+    bool render_special,
+    bool stream
 ) {
     const llama_vocab* vocab = llama_model_get_vocab(model);
     const auto n_vocab = static_cast<std::size_t>(llama_vocab_n_tokens(vocab));
@@ -359,7 +360,12 @@ Decoded run_decode(
         const auto token =
             static_cast<llama_token>(symbol_to_token(perm, symbol));
         result.tokens.push_back(token);
-        result.text += common_token_to_piece(ctx, token, render_special);
+        std::string piece = common_token_to_piece(ctx, token, render_special);
+        if (stream) {
+            std::print("{}", piece);
+            std::fflush(stdout);
+        }
+        result.text += piece;
     };
 
     ac::decode(code, bits, stop, prob_fn, on_symbol, pad);
@@ -611,7 +617,7 @@ int stego_encode_mode(std::string_view secret) {
         ac::Encoded code =
             run_encode(model, *secret_tokens, nullptr, false, true);
         Decoded cover =
-            run_decode(model, code.buffer, code.bits, &perm, true, false);
+            run_decode(model, code.buffer, code.bits, &perm, true, false, false);
 
         std::print("```\n{}\n```\n", cover.text);
         std::fflush(stdout);
@@ -666,11 +672,7 @@ int stego_decode_mode(std::string_view raw_cover) {
         tokenize_text(vocab, cover);
     if (cover_tokens) {
         ac::Encoded code = run_encode(model, *cover_tokens, &perm, true, false);
-        Decoded secret =
-            run_decode(model, code.buffer, code.bits, nullptr, false, true);
-
-        std::print("{}", secret.text);
-        std::fflush(stdout);
+        run_decode(model, code.buffer, code.bits, nullptr, false, true, true);
         status = 0;
     }
 
