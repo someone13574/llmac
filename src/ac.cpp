@@ -135,14 +135,19 @@ class BitReader {
     std::span<const std::uint32_t> code;
     std::size_t bits;
     std::size_t pos = 0;
+    const PadFn& pad;
 
   public:
-    BitReader(std::span<const std::uint32_t> code_, std::size_t bits_)
-        : code(code_), bits(bits_) {}
+    BitReader(
+        std::span<const std::uint32_t> code_,
+        std::size_t bits_,
+        const PadFn& pad_
+    )
+        : code(code_), bits(bits_), pad(pad_) {}
 
     std::uint32_t next() {
         if (pos >= bits) {
-            return 0;
+            return pad ? pad() : 0U;
         }
 
         std::uint32_t word = code[pos / 32];
@@ -186,11 +191,12 @@ std::vector<Symbol> decode(
     std::size_t bits,
     Symbol stop,
     const GetProbs& prob_fn,
-    const OnSymbol& on_symbol
+    const OnSymbol& on_symbol,
+    const PadFn& pad
 ) {
     std::vector<Symbol> seq;
 
-    BitReader reader(code, bits);
+    BitReader reader(code, bits, pad);
 
     std::uint32_t low = 0;
     std::uint32_t high = WHOLE - 1;

@@ -12,6 +12,7 @@
 #include <llama.h>
 #include <optional>
 #include <print>
+#include <random>
 #include <span>
 #include <string>
 #include <string_view>
@@ -22,12 +23,15 @@
 
 namespace {
 
+// constexpr const char* MODEL_PATH =
+// "models/HuggingFaceTB.SmolLM3-3B-Base.Q4_K_M.gguf";
 constexpr const char* MODEL_PATH = "models/Qwen3-0.6B-Q4_K_M.gguf";
+
+constexpr std::uint32_t PAD_SEED = 0x9E37'79B9U;
 
 constexpr std::size_t WINDOW = 2048;
 constexpr std::size_t OVERLAP = 512;
 
-/// Most tokens fed to llama-decode at once
 constexpr std::size_t CHUNK = 512;
 
 void quiet_log(
@@ -180,6 +184,190 @@ std::optional<std::string> read_file(const char* path) {
     return content;
 }
 
+std::optional<std::vector<llama_token>>
+tokenize_text(const llama_vocab* vocab, std::string_view text) {
+    const int needed = -llama_tokenize(
+        vocab,
+        text.data(),
+        static_cast<int>(text.size()),
+        nullptr,
+        0,
+        true,
+        false
+    );
+    if (needed <= 0) {
+        return std::vector<llama_token> {};
+    }
+
+    std::vector<llama_token> tokens(static_cast<std::size_t>(needed));
+    const int written = llama_tokenize(
+        vocab,
+        text.data(),
+        static_cast<int>(text.size()),
+        tokens.data(),
+        static_cast<int>(tokens.size()),
+        true,
+        false
+    );
+    if (written < 0) {
+        std::println(stderr, "error: unable to tokenize text");
+        return std::nullopt;
+    }
+    tokens.resize(static_cast<std::size_t>(written));
+    return tokens;
+}
+
+ac::Encoded run_encode(
+    llama_model* model,
+    std::span<const llama_token> feed,
+    const Perm* perm,
+    bool suppress_eos,
+    bool append_eos
+) {
+    const llama_vocab* vocab = llama_model_get_vocab(model);
+    const auto n_vocab = static_cast<std::size_t>(llama_vocab_n_tokens(vocab));
+    const bool add_bos = llama_vocab_get_add_bos(vocab);
+    const auto eos = static_cast<ac::Symbol>(llama_vocab_eos(vocab));
+    const std::size_t start = (add_bos && !feed.empty()) ? 1 : 0;
+
+    std::vector<ac::Symbol> seq;
+    seq.reserve(feed.size() - start + (append_eos ? 1 : 0));
+    for (std::size_t idx = start; idx < feed.size(); idx++) {
+        seq.push_back(
+            token_to_symbol(perm, static_cast<ac::Symbol>(feed[idx]))
+        );
+    }
+    if (append_eos) {
+        seq.push_back(token_to_symbol(perm, eos));
+    }
+
+    llama_context* ctx = nullptr;
+    std::optional<WindowedEvaluator> eval;
+    if (!feed.empty()) {
+        const std::size_t n_ctx = std::min(WINDOW, feed.size());
+        llama_context_params ctx_params = context_params(
+            static_cast<int>(n_ctx),
+            static_cast<int>(std::min(CHUNK, n_ctx))
+        );
+        ctx = llama_init_from_model(model, ctx_params);
+        if (ctx == nullptr) {
+            std::println(stderr, "error: failed to create the context");
+            std::exit(1);
+        }
+        eval.emplace(ctx, vocab);
+    }
+
+    std::deque<std::vector<std::uint32_t>> pending;
+    if (start == 0) {
+        pending.push_back(
+            symbol_row(uniform_freqs(n_vocab), perm, eos, suppress_eos)
+        );
+    }
+    std::size_t fed = 0;
+    ac::GetProbs prob_fn = [&](std::span<const ac::Symbol>) {
+        while (pending.empty()) {
+            const std::size_t take = std::min(CHUNK, feed.size() - fed);
+            eval->feed(
+                feed.subspan(fed, take),
+                [&](std::vector<std::uint32_t> row) {
+                    pending.push_back(
+                        symbol_row(std::move(row), perm, eos, suppress_eos)
+                    );
+                }
+            );
+            fed += take;
+        }
+        std::vector<std::uint32_t> row = std::move(pending.front());
+        pending.pop_front();
+        return row;
+    };
+
+    ac::Encoded encoded = ac::encode(seq, prob_fn);
+    if (ctx != nullptr) {
+        llama_free(ctx);
+    }
+    return encoded;
+}
+
+struct Decoded {
+    std::vector<llama_token> tokens;
+    std::string text;
+};
+
+Decoded run_decode(
+    llama_model* model,
+    std::span<const std::uint32_t> code,
+    std::size_t bits,
+    const Perm* perm,
+    bool stego,
+    bool render_special
+) {
+    const llama_vocab* vocab = llama_model_get_vocab(model);
+    const auto n_vocab = static_cast<std::size_t>(llama_vocab_n_tokens(vocab));
+    const bool add_bos = llama_vocab_get_add_bos(vocab);
+    const llama_token bos = llama_vocab_bos(vocab);
+    const auto eos = static_cast<ac::Symbol>(llama_vocab_eos(vocab));
+    const ac::Symbol stop = token_to_symbol(perm, eos);
+
+    llama_context_params ctx_params =
+        context_params(static_cast<int>(WINDOW), static_cast<int>(CHUNK));
+    llama_context* ctx = llama_init_from_model(model, ctx_params);
+    if (ctx == nullptr) {
+        std::println(stderr, "error: failed to create the context");
+        std::exit(1);
+    }
+
+    WindowedEvaluator eval(ctx, vocab);
+    auto next_row = [&](llama_token token) {
+        std::vector<std::uint32_t> row;
+        eval.feed(std::span(&token, 1), [&](std::vector<std::uint32_t> freqs) {
+            row = std::move(freqs);
+        });
+        return symbol_row(std::move(row), perm, eos, false);
+    };
+
+    bool drained = false;
+    std::size_t pad_tokens = 0;
+    std::mt19937 rng(PAD_SEED);
+    ac::PadFn pad = stego ? ac::PadFn([&] {
+        drained = true;
+        return rng() & 1U;
+    })
+                          : ac::PadFn {};
+
+    auto first_row = [&] {
+        return add_bos ? next_row(bos)
+                       : symbol_row(uniform_freqs(n_vocab), perm, eos, false);
+    };
+    ac::GetProbs prob_fn = [&](std::span<const ac::Symbol> seq) {
+        std::vector<std::uint32_t> row =
+            seq.empty() ? first_row()
+                        : next_row(
+                              static_cast<llama_token>(
+                                  symbol_to_token(perm, seq.back())
+                              )
+                          );
+        if (stego) {
+            shape_eos(row, stop, drained, pad_tokens);
+            pad_tokens += drained ? 1 : 0;
+        }
+        return row;
+    };
+
+    Decoded result;
+    ac::OnSymbol on_symbol = [&](ac::Symbol symbol) {
+        const auto token =
+            static_cast<llama_token>(symbol_to_token(perm, symbol));
+        result.tokens.push_back(token);
+        result.text += common_token_to_piece(ctx, token, render_special);
+    };
+
+    ac::decode(code, bits, stop, prob_fn, on_symbol, pad);
+
+    llama_free(ctx);
+    return result;
+}
+
 int encode_mode(std::string_view text) {
     llama_model* model = load_model();
     if (model == nullptr) {
@@ -226,8 +414,6 @@ int encode_mode(std::string_view text) {
     const bool add_bos = llama_vocab_get_add_bos(vocab);
     const std::size_t start = (add_bos && n_tokens >= 1) ? 1 : 0;
 
-    // The symbols are the message tokens followed by EOS, which marks the
-    // end of the message so no explicit length is transmitted.
     std::vector<ac::Symbol> seq;
     seq.reserve(tokens.size() - start + 1);
     for (std::size_t idx = start; idx < tokens.size(); idx++) {
@@ -353,8 +539,6 @@ int decode_mode(std::string_view raw) {
         return 1;
     }
 
-    // The message length is unknown until EOS decodes, so the context is
-    // sized for a full window up front.
     llama_context_params ctx_params =
         context_params(static_cast<int>(WINDOW), static_cast<int>(CHUNK));
 
@@ -405,14 +589,106 @@ int decode_mode(std::string_view raw) {
     return 0;
 }
 
+int stego_encode_mode(std::string_view secret) {
+    llama_model* model = load_model();
+    if (model == nullptr) {
+        return 1;
+    }
+
+    const llama_vocab* vocab = llama_model_get_vocab(model);
+    if (llama_vocab_eos(vocab) == LLAMA_TOKEN_NULL) {
+        std::println(stderr, "error: model vocab has no EOS token");
+        llama_model_free(model);
+        return 1;
+    }
+    const Perm perm =
+        Perm::shuffle(static_cast<std::size_t>(llama_vocab_n_tokens(vocab)));
+
+    int status = 1;
+    std::optional<std::vector<llama_token>> secret_tokens =
+        tokenize_text(vocab, secret);
+    if (secret_tokens) {
+        ac::Encoded code =
+            run_encode(model, *secret_tokens, nullptr, false, true);
+        Decoded cover =
+            run_decode(model, code.buffer, code.bits, &perm, true, false);
+
+        std::print("```\n{}\n```\n", cover.text);
+        std::fflush(stdout);
+
+        const bool add_bos = llama_vocab_get_add_bos(vocab);
+        const std::size_t start = (add_bos && !secret_tokens->empty()) ? 1 : 0;
+        std::println(
+            stderr,
+            "hid {} secret tokens ({} bits) in {} cover tokens",
+            secret_tokens->size() - start,
+            code.bits,
+            cover.tokens.size()
+        );
+        status = 0;
+    }
+
+    llama_model_free(model);
+    return status;
+}
+
+std::string_view strip_code_fence(std::string_view text) {
+    if (!text.starts_with("```")) {
+        return text;
+    }
+    const std::size_t after_open = text.find('\n');
+    if (after_open == std::string_view::npos) {
+        return text;
+    }
+    std::string_view body = text.substr(after_open + 1);
+    const std::size_t close = body.rfind("\n```");
+    return close == std::string_view::npos ? body : body.substr(0, close);
+}
+
+int stego_decode_mode(std::string_view raw_cover) {
+    llama_model* model = load_model();
+    if (model == nullptr) {
+        return 1;
+    }
+
+    const llama_vocab* vocab = llama_model_get_vocab(model);
+    if (llama_vocab_eos(vocab) == LLAMA_TOKEN_NULL) {
+        std::println(stderr, "error: model vocab has no EOS token");
+        llama_model_free(model);
+        return 1;
+    }
+    const Perm perm =
+        Perm::shuffle(static_cast<std::size_t>(llama_vocab_n_tokens(vocab)));
+
+    const std::string_view cover = strip_code_fence(raw_cover);
+    int status = 1;
+    std::optional<std::vector<llama_token>> cover_tokens =
+        tokenize_text(vocab, cover);
+    if (cover_tokens) {
+        ac::Encoded code = run_encode(model, *cover_tokens, &perm, true, false);
+        Decoded secret =
+            run_decode(model, code.buffer, code.bits, nullptr, false, true);
+
+        std::print("{}", secret.text);
+        std::fflush(stdout);
+        status = 0;
+    }
+
+    llama_model_free(model);
+    return status;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
     llama_log_set(quiet_log, nullptr);
 
     constexpr std::string_view usage =
-        "usage: llmac <encode|decode> [-f] <text|hex>\n"
-        "  -f, --file    read the text/hex from the file at the given path";
+        "usage: llmac <encode|decode|stego-encode|stego-decode> [-f] <input>\n"
+        "  encode|decode        compress text to hex / hex back to text\n"
+        "  stego-encode         hide secret text inside natural cover text\n"
+        "  stego-decode         recover the secret from that cover text\n"
+        "  -f, --file           read the input from the file at the given path";
 
     if (argc < 3 || argc > 4) {
         std::println(stderr, "{}", usage);
@@ -420,7 +696,8 @@ int main(int argc, char** argv) {
     }
 
     const std::string_view mode = argv[1];
-    if (mode != "encode" && mode != "decode") {
+    if (mode != "encode" && mode != "decode" && mode != "stego-encode"
+        && mode != "stego-decode") {
         std::println(stderr, "{}", usage);
         return 1;
     }
@@ -451,5 +728,11 @@ int main(int argc, char** argv) {
     if (mode == "encode") {
         return encode_mode(input);
     }
-    return decode_mode(input);
+    if (mode == "decode") {
+        return decode_mode(input);
+    }
+    if (mode == "stego-encode") {
+        return stego_encode_mode(input);
+    }
+    return stego_decode_mode(input);
 }
