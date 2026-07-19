@@ -56,10 +56,6 @@ constexpr double STEGO_TOP_P = 0.95;
 
 } // namespace
 
-std::vector<std::uint32_t> uniform_freqs(std::size_t count) {
-    return std::vector<std::uint32_t>(count, 1);
-}
-
 std::vector<double> uniform_probs(std::size_t count) {
     return std::vector<double>(count, 1.0);
 }

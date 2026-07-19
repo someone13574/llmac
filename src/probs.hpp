@@ -13,8 +13,6 @@ std::vector<std::uint32_t> quantize(std::span<const double> probs);
 
 std::vector<double> uniform_probs(std::size_t count);
 
-std::vector<std::uint32_t> uniform_freqs(std::size_t count);
-
 struct Perm {
     std::vector<ac::Symbol> to_token;
     std::vector<ac::Symbol> to_symbol;

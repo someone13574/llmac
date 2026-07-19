@@ -622,7 +622,7 @@ int decode_mode(std::string_view raw) {
 
     ac::GetProbs prob_fn = [&](std::span<const ac::Symbol> seq) {
         if (seq.empty()) {
-            return add_bos ? next_row(bos) : uniform_freqs(n_vocab);
+            return add_bos ? next_row(bos) : quantize(uniform_probs(n_vocab));
         }
         return next_row(static_cast<llama_token>(seq.back()));
     };
