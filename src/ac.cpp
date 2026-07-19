@@ -3,6 +3,8 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <numeric>
 #include <span>
 #include <vector>
@@ -192,7 +194,8 @@ std::vector<Symbol> decode(
     Symbol stop,
     const GetProbs& prob_fn,
     const OnSymbol& on_symbol,
-    const PadFn& pad
+    const PadFn& pad,
+    std::size_t* committed
 ) {
     std::vector<Symbol> seq;
 
@@ -206,7 +209,13 @@ std::vector<Symbol> decode(
         value = (value << 1) | reader.next();
     }
 
+    std::size_t committed_bits = 0;
+    std::uint32_t pending = 0;
+
     while (true) {
+        if (committed != nullptr) {
+            *committed = committed_bits;
+        }
         std::uint64_t range = static_cast<std::uint64_t>(high) - low + 1;
         auto probs = prob_fn(seq);
 
@@ -227,14 +236,19 @@ std::vector<Symbol> decode(
 
         while (true) {
             if (high < HALF) {
+                committed_bits += 1 + pending;
+                pending = 0;
             } else if (low >= HALF) {
                 low -= HALF;
                 high -= HALF;
                 value -= HALF;
+                committed_bits += 1 + pending;
+                pending = 0;
             } else if (low >= QUARTER && high < THREE_QUARTERS) {
                 low -= QUARTER;
                 high -= QUARTER;
                 value -= QUARTER;
+                pending += 1;
             } else {
                 break;
             }

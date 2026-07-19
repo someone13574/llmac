@@ -24,11 +24,11 @@
 
 namespace {
 
-// constexpr const char* MODEL_PATH =
-// "models/HuggingFaceTB.SmolLM3-3B-Base.Q4_K_M.gguf";
-constexpr const char* MODEL_PATH = "models/Qwen3-0.6B-Q4_K_M.gguf";
+constexpr const char* MODEL_PATH =
+    "models/HuggingFaceTB.SmolLM3-3B-Base.Q4_K_M.gguf";
+// constexpr const char* MODEL_PATH = "models/Qwen3-0.6B-Q4_K_M.gguf";
 
-constexpr std::uint32_t PAD_SEED = 0x9E37'79B9U;
+constexpr std::uint32_t PAD_SEED = 0x9E3779B9U;
 
 constexpr std::size_t WINDOW = 2048;
 constexpr std::size_t OVERLAP = 512;
@@ -36,8 +36,7 @@ constexpr std::size_t OVERLAP = 512;
 constexpr std::size_t CHUNK = 512;
 
 constexpr std::string_view STEGO_PRIME =
-    "Here is one of my favorite recipes. It is simple to make at home and "
-    "always turns out delicious.\n\n";
+    "# Smoked Salmon Salad\n\nIngredients:\n";
 
 void quiet_log(
     ggml_log_level level,
@@ -80,7 +79,7 @@ class WindowedEvaluator {
     std::size_t n_in_ctx = 0;
 
   public:
-    using OnRow = std::function<void(std::vector<std::uint32_t>)>;
+    using OnRow = std::function<void(std::vector<double>)>;
 
     WindowedEvaluator(llama_context* context, const llama_vocab* vocab)
         : ctx(context),
@@ -159,7 +158,7 @@ class WindowedEvaluator {
                 std::println(stderr, "error: failed to get logits");
                 std::exit(1);
             }
-            on_row(quantize_probs(std::span(logits, n_vocab)));
+            on_row(softmax_probs(std::span(logits, n_vocab)));
         }
     }
 };
@@ -272,31 +271,32 @@ ac::Encoded run_encode(
         canon.emplace(vocab);
     }
 
-    std::deque<std::vector<std::uint32_t>> pending;
+    std::deque<std::vector<double>> pending;
     if (warm.empty()) {
-        pending.push_back(uniform_freqs(n_vocab));
+        pending.push_back(uniform_probs(n_vocab));
     } else {
-        std::vector<std::uint32_t> primed_row;
-        eval->feed(warm, [&](std::vector<std::uint32_t> row) {
+        std::vector<double> primed_row;
+        eval->feed(warm, [&](std::vector<double> row) {
             primed_row = std::move(row);
         });
         pending.push_back(std::move(primed_row));
     }
+    const std::size_t feed_chunk = canonical ? 1 : CHUNK;
     std::size_t fed = 0;
     std::size_t step = 0;
     ac::GetProbs prob_fn = [&](std::span<const ac::Symbol>) {
         while (pending.empty()) {
-            const std::size_t take = std::min(CHUNK, content.size() - fed);
+            const std::size_t take =
+                std::min(feed_chunk, content.size() - fed);
             eval->feed(
                 content.subspan(fed, take),
-                [&](std::vector<std::uint32_t> row) {
-                    pending.push_back(std::move(row));
-                }
+                [&](std::vector<double> row) { pending.push_back(std::move(row)); }
             );
             fed += take;
         }
-        std::vector<std::uint32_t> row = std::move(pending.front());
+        std::vector<double> soft = std::move(pending.front());
         pending.pop_front();
+        std::vector<std::uint32_t> row = quantize(soft);
         if (canon) {
             if (step > 0) {
                 canon->push(static_cast<llama_token>(content[step - 1]));
@@ -350,14 +350,14 @@ Decoded run_decode(
 
     WindowedEvaluator eval(ctx, vocab);
     auto next_row = [&](llama_token token) {
-        std::vector<std::uint32_t> row;
-        eval.feed(std::span(&token, 1), [&](std::vector<std::uint32_t> freqs) {
-            row = std::move(freqs);
+        std::vector<double> row;
+        eval.feed(std::span(&token, 1), [&](std::vector<double> probs) {
+            row = std::move(probs);
         });
         return row;
     };
 
-    std::vector<std::uint32_t> primed_row;
+    std::vector<double> primed_row;
     bool primed = false;
     {
         std::vector<llama_token> warm;
@@ -367,7 +367,7 @@ Decoded run_decode(
         }
         warm.insert(warm.end(), prime.begin(), prime.end());
         if (!warm.empty()) {
-            eval.feed(warm, [&](std::vector<std::uint32_t> row) {
+            eval.feed(warm, [&](std::vector<double> row) {
                 primed_row = std::move(row);
             });
             primed = true;
@@ -379,27 +379,30 @@ Decoded run_decode(
         canon.emplace(vocab);
     }
 
-    bool drained = false;
-    std::size_t pad_tokens = 0;
+    const std::size_t target = bits;
+    std::size_t committed = 0;
     std::mt19937 rng(PAD_SEED);
-    ac::PadFn pad = stego ? ac::PadFn([&] {
-        drained = true;
-        return rng() & 1U;
-    })
-                          : ac::PadFn {};
+    ac::PadFn pad =
+        stego ? ac::PadFn([&] { return rng() & 1U; }) : ac::PadFn {};
 
     ac::GetProbs prob_fn = [&](std::span<const ac::Symbol> seq) {
-        std::vector<std::uint32_t> row;
+        std::vector<double> soft;
         if (seq.empty()) {
-            row = primed ? primed_row : uniform_freqs(n_vocab);
+            soft = primed ? primed_row : uniform_probs(n_vocab);
         } else {
             const auto prev =
                 static_cast<llama_token>(symbol_to_token(perm, seq.back()));
             if (canon) {
                 canon->push(prev);
             }
-            row = next_row(prev);
+            soft = next_row(prev);
         }
+        bool suppress = false;
+        if (stego) {
+            suppress = committed < target;
+            shape_eos(soft, eos, committed, target);
+        }
+        std::vector<std::uint32_t> row = quantize(soft);
         if (canon) {
             mask_row(
                 row,
@@ -407,13 +410,7 @@ Decoded run_decode(
             );
             top_p_filter(row, eos);
         }
-        std::vector<std::uint32_t> out =
-            symbol_row(std::move(row), perm, eos, false);
-        if (stego) {
-            shape_eos(out, stop, drained, pad_tokens);
-            pad_tokens += drained ? 1 : 0;
-        }
-        return out;
+        return symbol_row(std::move(row), perm, eos, suppress);
     };
 
     Decoded result;
@@ -429,7 +426,7 @@ Decoded run_decode(
         result.text += piece;
     };
 
-    ac::decode(code, bits, stop, prob_fn, on_symbol, pad);
+    ac::decode(code, bits, stop, prob_fn, on_symbol, pad, &committed);
 
     llama_free(ctx);
     return result;
@@ -508,9 +505,9 @@ int encode_mode(std::string_view text) {
         eval.emplace(ctx, vocab);
     }
 
-    std::deque<std::vector<std::uint32_t>> pending;
+    std::deque<std::vector<double>> pending;
     if (start == 0) {
-        pending.push_back(uniform_freqs(n_vocab));
+        pending.push_back(uniform_probs(n_vocab));
     }
     std::size_t fed = 0;
     ac::GetProbs prob_fn = [&](std::span<const ac::Symbol>) {
@@ -518,15 +515,13 @@ int encode_mode(std::string_view text) {
             const std::size_t take = std::min(CHUNK, tokens.size() - fed);
             eval->feed(
                 std::span(tokens).subspan(fed, take),
-                [&](std::vector<std::uint32_t> row) {
-                    pending.push_back(std::move(row));
-                }
+                [&](std::vector<double> row) { pending.push_back(std::move(row)); }
             );
             fed += take;
         }
-        std::vector<std::uint32_t> row = std::move(pending.front());
+        std::vector<double> soft = std::move(pending.front());
         pending.pop_front();
-        return row;
+        return quantize(soft);
     };
 
     ac::Encoded encoded = ac::encode(seq, prob_fn);
@@ -618,11 +613,11 @@ int decode_mode(std::string_view raw) {
 
     WindowedEvaluator eval(ctx, vocab);
     auto next_row = [&](llama_token token) {
-        std::vector<std::uint32_t> row;
-        eval.feed(std::span(&token, 1), [&](std::vector<std::uint32_t> freqs) {
-            row = std::move(freqs);
+        std::vector<double> soft;
+        eval.feed(std::span(&token, 1), [&](std::vector<double> probs) {
+            soft = std::move(probs);
         });
-        return row;
+        return quantize(soft);
     };
 
     ac::GetProbs prob_fn = [&](std::span<const ac::Symbol> seq) {

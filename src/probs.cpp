@@ -50,41 +50,9 @@ double det_exp2(double x) {
     return std::ldexp(p, static_cast<int>(xi));
 }
 
-constexpr std::uint32_t SHUFFLE_SEED = 0x5713'9A0BU;
-constexpr std::size_t STEGO_MARGIN = 16;
+constexpr std::uint32_t SHUFFLE_SEED = 0x57139A0BU;
 constexpr std::size_t STEGO_RAMP = 48;
 constexpr double STEGO_TOP_P = 0.95;
-
-void raise_eos(
-    std::vector<std::uint32_t>& probs,
-    ac::Symbol eos,
-    std::uint32_t target
-) {
-    target = std::min(target, ac::QUARTER);
-
-    std::uint64_t sum_others = 0;
-    for (ac::Symbol symbol = 0; symbol < probs.size(); symbol++) {
-        if (symbol != eos) {
-            sum_others += probs[symbol];
-        }
-    }
-
-    const std::uint32_t budget = ac::QUARTER - target;
-    std::uint64_t total = 0;
-    for (ac::Symbol symbol = 0; symbol < probs.size(); symbol++) {
-        if (symbol == eos) {
-            continue;
-        }
-        probs[symbol] = sum_others == 0
-                          ? 0
-                          : static_cast<std::uint32_t>(
-                                static_cast<std::uint64_t>(probs[symbol])
-                                * budget / sum_others
-                            );
-        total += probs[symbol];
-    }
-    probs[eos] = static_cast<std::uint32_t>(ac::QUARTER - total);
-}
 
 } // namespace
 
@@ -92,30 +60,47 @@ std::vector<std::uint32_t> uniform_freqs(std::size_t count) {
     return std::vector<std::uint32_t>(count, 1);
 }
 
-std::vector<std::uint32_t> quantize_probs(std::span<const float> logits) {
+std::vector<double> uniform_probs(std::size_t count) {
+    return std::vector<double>(count, 1.0);
+}
+
+std::vector<double> softmax_probs(std::span<const float> logits) {
     float max_logit = logits[0];
     for (float logit : logits) {
         max_logit = std::max(max_logit, logit);
     }
 
-    std::vector<double> weights(logits.size());
+    std::vector<double> probs(logits.size());
     double sum = 0.0;
     for (std::size_t idx = 0; idx < logits.size(); idx++) {
         double diff =
             static_cast<double>(logits[idx]) - static_cast<double>(max_logit);
-        weights[idx] = det_exp2(diff * std::numbers::log2e);
-        sum += weights[idx];
+        probs[idx] = det_exp2(diff * std::numbers::log2e);
+        sum += probs[idx];
     }
 
-    auto budget = static_cast<double>(ac::QUARTER - logits.size());
-    double scale = budget / sum;
+    for (double& prob : probs) {
+        prob /= sum;
+    }
 
-    std::vector<std::uint32_t> freqs(logits.size());
+    return probs;
+}
+
+std::vector<std::uint32_t> quantize(std::span<const double> probs) {
+    double sum = 0.0;
+    for (double prob : probs) {
+        sum += prob;
+    }
+
+    auto budget = static_cast<double>(ac::QUARTER - probs.size());
+    double scale = sum > 0.0 ? budget / sum : 0.0;
+
+    std::vector<std::uint32_t> freqs(probs.size());
     std::uint64_t total = 0;
     std::size_t top = 0;
-    for (std::size_t idx = 0; idx < logits.size(); idx++) {
+    for (std::size_t idx = 0; idx < probs.size(); idx++) {
         freqs[idx] =
-            1 + static_cast<std::uint32_t>(std::floor(weights[idx] * scale));
+            1 + static_cast<std::uint32_t>(std::floor(probs[idx] * scale));
         total += freqs[idx];
         if (freqs[idx] > freqs[top]) {
             top = idx;
@@ -176,24 +161,32 @@ std::vector<std::uint32_t> symbol_row(
 }
 
 void shape_eos(
-    std::vector<std::uint32_t>& probs,
+    std::vector<double>& probs,
     ac::Symbol stop,
-    bool drained,
-    std::size_t pad
+    std::size_t committed,
+    std::size_t target
 ) {
-    if (stop >= probs.size()) {
+    if (stop >= probs.size() || committed < target) {
         return;
     }
-    if (!drained || pad < STEGO_MARGIN) {
-        probs[stop] = 0;
-        return;
+    auto step = static_cast<double>(committed - target + 1);
+    double eos_prob = std::min(1.0, step / static_cast<double>(STEGO_RAMP));
+
+    double sum_others = 0.0;
+    for (std::size_t idx = 0; idx < probs.size(); idx++) {
+        if (idx != stop) {
+            sum_others += probs[idx];
+        }
     }
-    auto step = static_cast<std::uint32_t>(pad - STEGO_MARGIN + 1);
-    auto target = static_cast<std::uint32_t>(std::min<std::uint64_t>(
-        ac::QUARTER,
-        static_cast<std::uint64_t>(ac::QUARTER) * step / STEGO_RAMP
-    ));
-    raise_eos(probs, stop, target);
+    if (sum_others > 0.0) {
+        double scale = (1.0 - eos_prob) / sum_others;
+        for (std::size_t idx = 0; idx < probs.size(); idx++) {
+            if (idx != stop) {
+                probs[idx] *= scale;
+            }
+        }
+    }
+    probs[stop] = eos_prob;
 }
 
 void top_p_filter(std::vector<std::uint32_t>& probs, ac::Symbol eos) {

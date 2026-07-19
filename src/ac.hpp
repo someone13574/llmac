@@ -35,7 +35,8 @@ std::vector<Symbol> decode(
     Symbol stop,
     const GetProbs& prob_fn,
     const OnSymbol& on_symbol,
-    const PadFn& pad = {}
+    const PadFn& pad = {},
+    std::size_t* committed = nullptr
 );
 
 } // namespace ac

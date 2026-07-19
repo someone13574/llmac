@@ -7,7 +7,11 @@
 
 #include "ac.hpp"
 
-std::vector<std::uint32_t> quantize_probs(std::span<const float> logits);
+std::vector<double> softmax_probs(std::span<const float> logits);
+
+std::vector<std::uint32_t> quantize(std::span<const double> probs);
+
+std::vector<double> uniform_probs(std::size_t count);
 
 std::vector<std::uint32_t> uniform_freqs(std::size_t count);
 
@@ -30,10 +34,10 @@ std::vector<std::uint32_t> symbol_row(
 );
 
 void shape_eos(
-    std::vector<std::uint32_t>& probs,
+    std::vector<double>& probs,
     ac::Symbol stop,
-    bool drained,
-    std::size_t pad
+    std::size_t committed,
+    std::size_t target
 );
 
 void top_p_filter(std::vector<std::uint32_t>& probs, ac::Symbol eos);
