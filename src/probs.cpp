@@ -8,9 +8,7 @@
 #include <cstdint>
 #include <limits>
 #include <numbers>
-#include <random>
 #include <span>
-#include <utility>
 #include <vector>
 
 #include "ac.hpp"
@@ -49,10 +47,6 @@ double det_exp2(double x) {
 
     return std::ldexp(p, static_cast<int>(xi));
 }
-
-constexpr std::uint32_t SHUFFLE_SEED = 0x57139A0BU;
-constexpr std::size_t STEGO_RAMP = 48;
-constexpr double STEGO_TOP_P = 0.95;
 
 } // namespace
 
@@ -105,118 +99,4 @@ std::vector<std::uint32_t> quantize(std::span<const double> probs) {
     freqs[top] += static_cast<std::uint32_t>(ac::QUARTER - total);
 
     return freqs;
-}
-
-Perm Perm::shuffle(std::size_t n_vocab) {
-    Perm perm;
-    perm.to_token.resize(n_vocab);
-    for (std::size_t idx = 0; idx < n_vocab; idx++) {
-        perm.to_token[idx] = static_cast<ac::Symbol>(idx);
-    }
-
-    std::mt19937 rng(SHUFFLE_SEED);
-    for (std::size_t idx = n_vocab; idx-- > 1;) {
-        std::swap(perm.to_token[idx], perm.to_token[rng() % (idx + 1)]);
-    }
-
-    perm.to_symbol.resize(n_vocab);
-    for (std::size_t idx = 0; idx < n_vocab; idx++) {
-        perm.to_symbol[perm.to_token[idx]] = static_cast<ac::Symbol>(idx);
-    }
-    return perm;
-}
-
-ac::Symbol token_to_symbol(const Perm* perm, ac::Symbol token) {
-    return perm == nullptr ? token : perm->to_symbol[token];
-}
-
-ac::Symbol symbol_to_token(const Perm* perm, ac::Symbol symbol) {
-    return perm == nullptr ? symbol : perm->to_token[symbol];
-}
-
-std::vector<std::uint32_t> symbol_row(
-    std::vector<std::uint32_t> row,
-    const Perm* perm,
-    ac::Symbol eos,
-    bool suppress
-) {
-    if (perm != nullptr) {
-        std::vector<std::uint32_t> permuted(row.size());
-        for (std::size_t idx = 0; idx < row.size(); idx++) {
-            permuted[idx] = row[perm->to_token[idx]];
-        }
-        row = std::move(permuted);
-    }
-    if (suppress) {
-        const ac::Symbol eos_symbol = token_to_symbol(perm, eos);
-        if (eos_symbol < row.size()) {
-            row[eos_symbol] = 0;
-        }
-    }
-    return row;
-}
-
-void shape_eos(
-    std::vector<double>& probs,
-    ac::Symbol stop,
-    std::size_t committed,
-    std::size_t target
-) {
-    if (stop >= probs.size() || committed < target) {
-        return;
-    }
-    auto step = static_cast<double>(committed - target + 1);
-    double eos_prob = std::min(1.0, step / static_cast<double>(STEGO_RAMP));
-
-    double sum_others = 0.0;
-    for (std::size_t idx = 0; idx < probs.size(); idx++) {
-        if (idx != stop) {
-            sum_others += probs[idx];
-        }
-    }
-    if (sum_others > 0.0) {
-        double scale = (1.0 - eos_prob) / sum_others;
-        for (std::size_t idx = 0; idx < probs.size(); idx++) {
-            if (idx != stop) {
-                probs[idx] *= scale;
-            }
-        }
-    }
-    probs[stop] = eos_prob;
-}
-
-void top_p_filter(std::vector<std::uint32_t>& probs, ac::Symbol eos) {
-    std::uint64_t total = 0;
-    for (ac::Symbol symbol = 0; symbol < probs.size(); symbol++) {
-        if (symbol != eos) {
-            total += probs[symbol];
-        }
-    }
-    if (total == 0) {
-        return;
-    }
-
-    std::vector<ac::Symbol> order;
-    for (ac::Symbol symbol = 0; symbol < probs.size(); symbol++) {
-        if (symbol != eos && probs[symbol] != 0) {
-            order.push_back(symbol);
-        }
-    }
-    std::ranges::sort(order, [&](ac::Symbol lhs, ac::Symbol rhs) {
-        return probs[lhs] != probs[rhs] ? probs[lhs] > probs[rhs] : lhs < rhs;
-    });
-
-    const double limit = STEGO_TOP_P * static_cast<double>(total);
-    std::uint64_t cumulative = 0;
-    std::size_t keep = 0;
-    while (keep < order.size()) {
-        cumulative += probs[order[keep]];
-        keep++;
-        if (static_cast<double>(cumulative) >= limit) {
-            break;
-        }
-    }
-    for (std::size_t idx = keep; idx < order.size(); idx++) {
-        probs[order[idx]] = 0;
-    }
 }

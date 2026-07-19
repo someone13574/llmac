@@ -137,19 +137,14 @@ class BitReader {
     std::span<const std::uint32_t> code;
     std::size_t bits;
     std::size_t pos = 0;
-    const PadFn& pad;
 
   public:
-    BitReader(
-        std::span<const std::uint32_t> code_,
-        std::size_t bits_,
-        const PadFn& pad_
-    )
-        : code(code_), bits(bits_), pad(pad_) {}
+    BitReader(std::span<const std::uint32_t> code_, std::size_t bits_)
+        : code(code_), bits(bits_) {}
 
     std::uint32_t next() {
         if (pos >= bits) {
-            return pad ? pad() : 0U;
+            return 0U;
         }
 
         std::uint32_t word = code[pos / 32];
@@ -193,13 +188,11 @@ std::vector<Symbol> decode(
     std::size_t bits,
     Symbol stop,
     const GetProbs& prob_fn,
-    const OnSymbol& on_symbol,
-    const PadFn& pad,
-    std::size_t* committed
+    const OnSymbol& on_symbol
 ) {
     std::vector<Symbol> seq;
 
-    BitReader reader(code, bits, pad);
+    BitReader reader(code, bits);
 
     std::uint32_t low = 0;
     std::uint32_t high = WHOLE - 1;
@@ -209,13 +202,7 @@ std::vector<Symbol> decode(
         value = (value << 1) | reader.next();
     }
 
-    std::size_t committed_bits = 0;
-    std::uint32_t pending = 0;
-
     while (true) {
-        if (committed != nullptr) {
-            *committed = committed_bits;
-        }
         std::uint64_t range = static_cast<std::uint64_t>(high) - low + 1;
         auto probs = prob_fn(seq);
 
@@ -235,22 +222,17 @@ std::vector<Symbol> decode(
             low + static_cast<std::uint32_t>(range * symbol.low / symbol.total);
 
         while (true) {
-            if (high < HALF) {
-                committed_bits += 1 + pending;
-                pending = 0;
-            } else if (low >= HALF) {
+            if (low >= HALF) {
                 low -= HALF;
                 high -= HALF;
                 value -= HALF;
-                committed_bits += 1 + pending;
-                pending = 0;
-            } else if (low >= QUARTER && high < THREE_QUARTERS) {
+            } else if (high >= HALF) {
+                if (low < QUARTER || high >= THREE_QUARTERS) {
+                    break;
+                }
                 low -= QUARTER;
                 high -= QUARTER;
                 value -= QUARTER;
-                pending += 1;
-            } else {
-                break;
             }
 
             low = low << 1;

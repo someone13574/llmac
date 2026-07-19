@@ -25,8 +25,6 @@ using GetProbs =
 
 using OnSymbol = std::function<void(Symbol)>;
 
-using PadFn = std::function<std::uint32_t()>;
-
 Encoded encode(std::span<const Symbol> seq, const GetProbs& prob_fn);
 
 std::vector<Symbol> decode(
@@ -34,9 +32,7 @@ std::vector<Symbol> decode(
     std::size_t bits,
     Symbol stop,
     const GetProbs& prob_fn,
-    const OnSymbol& on_symbol,
-    const PadFn& pad = {},
-    std::size_t* committed = nullptr
+    const OnSymbol& on_symbol
 );
 
 } // namespace ac
