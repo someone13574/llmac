@@ -6,9 +6,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <deque>
 #include <fstream>
-#include <functional>
 #include <llama.h>
 #include <optional>
 #include <print>
@@ -73,8 +71,6 @@ class WindowedEvaluator {
     std::uint64_t epoch = 0;
 
   public:
-    using OnRow = std::function<void(std::vector<double>)>;
-
     struct Snapshot {
         std::vector<llama_token> history;
         std::size_t n_in_ctx = 0;
@@ -93,27 +89,45 @@ class WindowedEvaluator {
         llama_batch_free(batch);
     }
 
-    void feed(std::span<const llama_token> tokens, const OnRow& on_row) {
-        while (!tokens.empty()) {
-            if (n_in_ctx == WINDOW) {
-                slide();
-            }
-            const std::size_t take =
-                std::min({tokens.size(), WINDOW - n_in_ctx, CHUNK});
-            submit(tokens.first(take), on_row);
-            history.insert(
-                history.end(),
-                tokens.begin(),
-                tokens.begin() + static_cast<std::ptrdiff_t>(take)
-            );
-            if (history.size() > OVERLAP) {
-                history.erase(
-                    history.begin(),
-                    history.end() - static_cast<std::ptrdiff_t>(OVERLAP)
-                );
-            }
-            tokens = tokens.subspan(take);
+    std::size_t
+    submit_next(std::span<const llama_token> tokens, bool want_logits) {
+        if (tokens.empty()) {
+            return 0;
         }
+        if (n_in_ctx == WINDOW) {
+            slide();
+        }
+        const std::size_t take =
+            std::min({tokens.size(), WINDOW - n_in_ctx, CHUNK});
+        submit(tokens.first(take), want_logits);
+        history.insert(
+            history.end(),
+            tokens.begin(),
+            tokens.begin() + static_cast<std::ptrdiff_t>(take)
+        );
+        if (history.size() > OVERLAP) {
+            history.erase(
+                history.begin(),
+                history.end() - static_cast<std::ptrdiff_t>(OVERLAP)
+            );
+        }
+        return take;
+    }
+
+    void feed(std::span<const llama_token> tokens) {
+        while (!tokens.empty()) {
+            tokens = tokens.subspan(submit_next(tokens, false));
+        }
+    }
+
+    [[nodiscard]] std::span<const float> row(std::size_t idx) const {
+        const float* logits =
+            llama_get_logits_ith(ctx, static_cast<std::int32_t>(idx));
+        if (logits == nullptr) {
+            std::println(stderr, "error: failed to get logits");
+            std::exit(1);
+        }
+        return {logits, n_vocab};
     }
 
     [[nodiscard]] Snapshot snapshot() const {
@@ -138,7 +152,7 @@ class WindowedEvaluator {
         n_in_ctx = 0;
         history.clear();
         if (!snap.history.empty()) {
-            feed(snap.history, nullptr);
+            feed(snap.history);
         }
     }
 
@@ -150,19 +164,19 @@ class WindowedEvaluator {
         std::span<const llama_token> prefix(history);
         while (!prefix.empty()) {
             const std::size_t take = std::min(prefix.size(), CHUNK);
-            submit(prefix.first(take), nullptr);
+            submit(prefix.first(take), false);
             prefix = prefix.subspan(take);
         }
     }
 
-    void submit(std::span<const llama_token> tokens, const OnRow& on_row) {
+    void submit(std::span<const llama_token> tokens, bool want_logits) {
         batch.n_tokens = static_cast<std::int32_t>(tokens.size());
         for (std::size_t idx = 0; idx < tokens.size(); idx++) {
             batch.token[idx] = tokens[idx];
             batch.pos[idx] = static_cast<llama_pos>(n_in_ctx + idx);
             batch.n_seq_id[idx] = 1;
             batch.seq_id[idx][0] = 0;
-            batch.logits[idx] = on_row ? 1 : 0;
+            batch.logits[idx] = want_logits ? 1 : 0;
         }
 
         if (llama_decode(ctx, batch) != 0) {
@@ -174,19 +188,6 @@ class WindowedEvaluator {
             std::exit(1);
         }
         n_in_ctx += tokens.size();
-
-        if (!on_row) {
-            return;
-        }
-        for (std::size_t idx = 0; idx < tokens.size(); idx++) {
-            const float* logits =
-                llama_get_logits_ith(ctx, static_cast<std::int32_t>(idx));
-            if (logits == nullptr) {
-                std::println(stderr, "error: failed to get logits");
-                std::exit(1);
-            }
-            on_row(softmax_probs(std::span(logits, n_vocab)));
-        }
     }
 };
 
@@ -288,25 +289,21 @@ int encode_mode(std::string_view text) {
         eval.emplace(ctx, vocab);
     }
 
-    std::deque<std::vector<double>> pending;
-    if (start == 0) {
-        pending.push_back(uniform_probs(n_vocab));
-    }
+    bool want_uniform = start == 0;
     std::size_t fed = 0;
+    std::size_t cursor = 0;
+    std::size_t rows = 0;
     ac::GetProbs prob_fn = [&](std::span<const ac::Symbol>) {
-        while (pending.empty()) {
-            const std::size_t take = std::min(CHUNK, tokens.size() - fed);
-            eval->feed(
-                std::span(tokens).subspan(fed, take),
-                [&](std::vector<double> row) {
-                    pending.push_back(std::move(row));
-                }
-            );
-            fed += take;
+        if (want_uniform) {
+            want_uniform = false;
+            return quantize(uniform_probs(n_vocab));
         }
-        std::vector<double> soft = std::move(pending.front());
-        pending.pop_front();
-        return quantize(soft);
+        while (cursor == rows) {
+            rows = eval->submit_next(std::span(tokens).subspan(fed), true);
+            fed += rows;
+            cursor = 0;
+        }
+        return quantize(softmax_probs(eval->row(cursor++)));
     };
 
     ac::Encoded encoded = ac::encode(seq, prob_fn);
@@ -415,14 +412,11 @@ int decode_mode(std::string_view raw) {
         }
         fed = want;
 
-        std::vector<double> soft;
         if (tokens.size() > 1) {
-            eval.feed(std::span(tokens).first(tokens.size() - 1), nullptr);
+            eval.feed(std::span(tokens).first(tokens.size() - 1));
         }
-        eval.feed(std::span(&tokens.back(), 1), [&](std::vector<double> probs) {
-            soft = std::move(probs);
-        });
-        return quantize(soft);
+        eval.submit_next(std::span(&tokens.back(), 1), true);
+        return quantize(softmax_probs(eval.row(0)));
     };
 
     ac::OnSymbol on_symbol = [&](ac::Symbol symbol) {
