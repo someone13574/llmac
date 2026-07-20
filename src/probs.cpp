@@ -76,27 +76,44 @@ std::vector<double> softmax_probs(std::span<const float> logits) {
     return probs;
 }
 
+namespace {
+
+constexpr std::uint32_t FLOOR_COUNTS = 128;
+constexpr std::uint32_t GRID = 4096;
+
+} // namespace
+
+std::uint32_t quantize_step(std::size_t vocab) {
+    const std::uint64_t floor_total =
+        static_cast<std::uint64_t>(vocab) * FLOOR_COUNTS;
+    return static_cast<std::uint32_t>((ac::QUARTER - floor_total) / GRID);
+}
+
 std::vector<std::uint32_t> quantize(std::span<const double> probs) {
     double sum = 0.0;
     for (double prob : probs) {
         sum += prob;
     }
 
-    auto budget = static_cast<double>(ac::QUARTER - probs.size());
-    double scale = sum > 0.0 ? budget / sum : 0.0;
-
+    const std::uint32_t lattice = quantize_step(probs.size());
     std::vector<std::uint32_t> freqs(probs.size());
-    std::uint64_t total = 0;
-    std::size_t top = 0;
+    double cum = 0.0;
+    std::uint32_t prev = 0;
     for (std::size_t idx = 0; idx < probs.size(); idx++) {
-        freqs[idx] =
-            1 + static_cast<std::uint32_t>(std::floor(probs[idx] * scale));
-        total += freqs[idx];
-        if (freqs[idx] > freqs[top]) {
-            top = idx;
+        cum += sum > 0.0 ? probs[idx] : 1.0;
+        const double frac =
+            sum > 0.0 ? cum / sum : cum / static_cast<double>(probs.size());
+        auto cell = static_cast<std::uint32_t>(std::clamp(
+            std::llround(frac * GRID),
+            static_cast<long long>(prev),
+            static_cast<long long>(GRID)
+        ));
+        if (idx + 1 == probs.size()) {
+            cell = GRID;
         }
+        freqs[idx] = FLOOR_COUNTS + (lattice * (cell - prev));
+        prev = cell;
     }
-    freqs[top] += static_cast<std::uint32_t>(ac::QUARTER - total);
 
     return freqs;
 }

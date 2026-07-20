@@ -70,9 +70,16 @@ class WindowedEvaluator {
     llama_batch batch;
     std::vector<llama_token> history;
     std::size_t n_in_ctx = 0;
+    std::uint64_t epoch = 0;
 
   public:
     using OnRow = std::function<void(std::vector<double>)>;
+
+    struct Snapshot {
+        std::vector<llama_token> history;
+        std::size_t n_in_ctx = 0;
+        std::uint64_t epoch = 0;
+    };
 
     WindowedEvaluator(llama_context* context, const llama_vocab* vocab)
         : ctx(context),
@@ -109,9 +116,36 @@ class WindowedEvaluator {
         }
     }
 
+    [[nodiscard]] Snapshot snapshot() const {
+        return {.history = history, .n_in_ctx = n_in_ctx, .epoch = epoch};
+    }
+
+    void restore(const Snapshot& snap) {
+        if (snap.epoch == epoch && snap.n_in_ctx <= n_in_ctx
+            && llama_memory_seq_rm(
+                llama_get_memory(ctx),
+                0,
+                static_cast<llama_pos>(snap.n_in_ctx),
+                -1
+            )) {
+            n_in_ctx = snap.n_in_ctx;
+            history = snap.history;
+            return;
+        }
+
+        llama_memory_clear(llama_get_memory(ctx), true);
+        epoch += 1;
+        n_in_ctx = 0;
+        history.clear();
+        if (!snap.history.empty()) {
+            feed(snap.history, nullptr);
+        }
+    }
+
   private:
     void slide() {
         llama_memory_clear(llama_get_memory(ctx), true);
+        epoch += 1;
         n_in_ctx = 0;
         std::span<const llama_token> prefix(history);
         while (!prefix.empty()) {
@@ -363,19 +397,32 @@ int decode_mode(std::string_view raw) {
     }
 
     WindowedEvaluator eval(ctx, vocab);
-    auto next_row = [&](llama_token token) {
+
+    std::size_t fed = 0;
+    ac::GetProbs prob_fn = [&](std::span<const ac::Symbol> seq) {
+        const std::size_t lead = add_bos ? 1 : 0;
+        const std::size_t want = lead + seq.size();
+        if (want == 0) {
+            return quantize(uniform_probs(n_vocab));
+        }
+
+        std::vector<llama_token> tokens;
+        tokens.reserve(want - fed);
+        for (std::size_t idx = fed; idx < want; idx++) {
+            tokens.push_back(
+                idx < lead ? bos : static_cast<llama_token>(seq[idx - lead])
+            );
+        }
+        fed = want;
+
         std::vector<double> soft;
-        eval.feed(std::span(&token, 1), [&](std::vector<double> probs) {
+        if (tokens.size() > 1) {
+            eval.feed(std::span(tokens).first(tokens.size() - 1), nullptr);
+        }
+        eval.feed(std::span(&tokens.back(), 1), [&](std::vector<double> probs) {
             soft = std::move(probs);
         });
         return quantize(soft);
-    };
-
-    ac::GetProbs prob_fn = [&](std::span<const ac::Symbol> seq) {
-        if (seq.empty()) {
-            return add_bos ? next_row(bos) : quantize(uniform_probs(n_vocab));
-        }
-        return next_row(static_cast<llama_token>(seq.back()));
     };
 
     ac::OnSymbol on_symbol = [&](ac::Symbol symbol) {
@@ -386,11 +433,28 @@ int decode_mode(std::string_view raw) {
         std::fflush(stdout);
     };
 
-    ac::decode(
+    WindowedEvaluator::Snapshot snapshot;
+    std::size_t snapshot_fed = 0;
+    ac::BlockHooks hooks {
+        .save =
+            [&] {
+                snapshot = eval.snapshot();
+                snapshot_fed = fed;
+            },
+        .restore =
+            [&] {
+                eval.restore(snapshot);
+                fed = snapshot_fed;
+            },
+    };
+
+    ac::Decoded decoded = ac::decode(
         code,
         payload_nibbles * 4,
         static_cast<ac::Symbol>(eos),
+        quantize_step(n_vocab),
         prob_fn,
+        hooks,
         on_symbol
     );
 
@@ -398,6 +462,14 @@ int decode_mode(std::string_view raw) {
 
     llama_free(ctx);
     llama_model_free(model);
+
+    if (!decoded.ok) {
+        std::println(
+            stderr,
+            "error: decode failed; printed output is the verified prefix"
+        );
+        return 1;
+    }
 
     return 0;
 }
