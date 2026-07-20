@@ -5,16 +5,26 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <format>
 #include <numeric>
 #include <optional>
 #include <print>
 #include <span>
+#include <string_view>
 #include <utility>
 #include <vector>
 
 namespace ac {
 
 namespace {
+
+void note(const Sink& sink, std::string_view message) {
+    if (sink.note) {
+        sink.note(message);
+        return;
+    }
+    std::println(stderr, "{}", message);
+}
 
 constexpr std::size_t LEN_BITS = 16;
 constexpr std::size_t FINAL_CRC_BITS = 12;
@@ -316,6 +326,24 @@ SymbolRange tweaked_range(
     return sym;
 }
 
+std::optional<std::size_t> failed_checkpoint(
+    std::size_t step,
+    const BlockChecks& checks,
+    std::span<const Symbol> symbols
+) {
+    if (step % CHECK_EVERY != CHECK_EVERY - 1
+        || step / CHECK_EVERY >= checks.count) {
+        return std::nullopt;
+    }
+
+    const std::size_t check = step / CHECK_EVERY;
+    const std::uint32_t mask = (1U << CHECK_BITS) - 1U;
+    if ((crc32(symbols) & mask) == checks.expect[check]) {
+        return std::nullopt;
+    }
+    return check;
+}
+
 Attempt decode_block(
     BitReader& reader,
     std::size_t payload_pos,
@@ -327,7 +355,8 @@ Attempt decode_block(
     std::vector<Symbol>& context,
     std::span<const StepInfo> replay,
     std::span<const Tweak> tweaks,
-    FirstPass* first
+    FirstPass* first,
+    const Sink* sink
 ) {
     std::size_t fresh_from = 0;
     for (const Tweak& tweak : tweaks) {
@@ -386,20 +415,20 @@ Attempt decode_block(
             return attempt;
         }
         context.push_back(sym.symbol);
+        if (sink != nullptr) {
+            sink->emit(sym.symbol);
+        }
 
         apply_symbol(state, sym, reader);
         if (reader.position() > bit_limit) {
             return attempt;
         }
 
-        if (step % CHECK_EVERY == CHECK_EVERY - 1
-            && step / CHECK_EVERY < checks.count) {
-            const std::size_t check = step / CHECK_EVERY;
-            const std::uint32_t mask = (1U << CHECK_BITS) - 1U;
-            if ((crc32(attempt.symbols) & mask) != checks.expect[check]) {
-                attempt.failed_check = check;
-                return attempt;
-            }
+        const std::optional<std::size_t> failed =
+            failed_checkpoint(step, checks, attempt.symbols);
+        if (failed) {
+            attempt.failed_check = *failed;
+            return attempt;
         }
     }
     return attempt;
@@ -548,7 +577,18 @@ bool verify(
     return reader.read_bits(32) == crc32(attempt.symbols);
 }
 
-std::optional<Attempt> repair_block(
+void emit_all(const Sink& sink, const Attempt& attempt) {
+    if (!sink.emit) {
+        return;
+    }
+    const std::size_t count =
+        attempt.symbols.size() - (attempt.found_stop ? 1 : 0);
+    for (std::size_t idx = 0; idx < count; idx++) {
+        sink.emit(attempt.symbols[idx]);
+    }
+}
+
+std::optional<Attempt> recover_block(
     BitReader& reader,
     const BlockLayout& layout,
     Symbol stop,
@@ -556,12 +596,24 @@ std::optional<Attempt> repair_block(
     std::uint32_t lattice,
     const GetProbs& prob_fn,
     const BlockHooks& hooks,
+    const Sink& sink,
     std::vector<Symbol>& context,
     std::size_t base,
     const FirstPass& first,
     std::size_t failed_check,
     std::size_t block_index
 ) {
+    if (sink.rewind) {
+        sink.rewind(base);
+    }
+    note(
+        sink,
+        std::format(
+            "block {}: verification failed, searching for repair",
+            block_index
+        )
+    );
+
     constexpr std::size_t WINDOW_SLACK = 8;
     std::size_t window_lo = 0;
     if (failed_check != SIZE_MAX && failed_check > 0) {
@@ -587,25 +639,31 @@ std::optional<Attempt> repair_block(
             context,
             first.steps,
             candidates[idx],
+            nullptr,
             nullptr
         );
         if (verify(reader, layout, retry)) {
-            std::println(
-                stderr,
-                "block {}: repaired (candidate {} of {})",
-                block_index,
-                idx + 1,
-                candidates.size()
+            note(
+                sink,
+                std::format(
+                    "block {}: repaired (candidate {} of {})",
+                    block_index,
+                    idx + 1,
+                    candidates.size()
+                )
             );
+            emit_all(sink, retry);
             return retry;
         }
     }
 
-    std::println(
-        stderr,
-        "block {}: unrepairable after {} candidates",
-        block_index,
-        candidates.size()
+    note(
+        sink,
+        std::format(
+            "block {}: unrepairable after {} candidates",
+            block_index,
+            candidates.size()
+        )
     );
     return std::nullopt;
 }
@@ -670,7 +728,7 @@ Decoded decode(
     std::uint32_t lattice,
     const GetProbs& prob_fn,
     const BlockHooks& hooks,
-    const OnSymbol& on_symbol
+    const Sink& sink
 ) {
     Decoded out;
     BitReader reader(code, bits);
@@ -680,10 +738,9 @@ Decoded decode(
     while (true) {
         std::optional<BlockLayout> layout = parse_layout(reader, pos, bits);
         if (!layout) {
-            std::println(
-                stderr,
-                "error: truncated stream at block {}",
-                block_index
+            note(
+                sink,
+                std::format("error: truncated stream at block {}", block_index)
             );
             return out;
         }
@@ -712,16 +769,12 @@ Decoded decode(
             out.symbols,
             {},
             {},
-            &first
+            &first,
+            sink.emit ? &sink : nullptr
         );
 
         if (!verify(reader, *layout, attempt)) {
-            std::println(
-                stderr,
-                "block {}: verification failed, searching for repair",
-                block_index
-            );
-            std::optional<Attempt> repaired = repair_block(
+            std::optional<Attempt> repaired = recover_block(
                 reader,
                 *layout,
                 stop,
@@ -729,6 +782,7 @@ Decoded decode(
                 lattice,
                 prob_fn,
                 hooks,
+                sink,
                 out.symbols,
                 base,
                 first,
@@ -742,12 +796,8 @@ Decoded decode(
             attempt = std::move(*repaired);
         }
 
-        if (on_symbol) {
-            const std::size_t emit =
-                attempt.symbols.size() - (attempt.found_stop ? 1 : 0);
-            for (std::size_t idx = 0; idx < emit; idx++) {
-                on_symbol(attempt.symbols[idx]);
-            }
+        if (sink.commit) {
+            sink.commit();
         }
 
         if (layout->final) {

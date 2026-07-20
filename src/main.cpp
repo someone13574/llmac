@@ -17,6 +17,7 @@
 
 #include "ac.hpp"
 #include "probs.hpp"
+#include "stream.hpp"
 
 namespace {
 
@@ -419,13 +420,13 @@ int decode_mode(std::string_view raw) {
         return quantize(softmax_probs(eval.row(0)));
     };
 
-    ac::OnSymbol on_symbol = [&](ac::Symbol symbol) {
-        std::print(
-            "{}",
-            common_token_to_piece(ctx, static_cast<llama_token>(symbol), true)
+    TextStream stream([&](ac::Symbol symbol) {
+        return common_token_to_piece(
+            ctx,
+            static_cast<llama_token>(symbol),
+            true
         );
-        std::fflush(stdout);
-    };
+    });
 
     WindowedEvaluator::Snapshot snapshot;
     std::size_t snapshot_fed = 0;
@@ -449,10 +450,10 @@ int decode_mode(std::string_view raw) {
         quantize_step(n_vocab),
         prob_fn,
         hooks,
-        on_symbol
+        stream.sink()
     );
 
-    std::println("");
+    stream.finish();
 
     llama_free(ctx);
     llama_model_free(model);

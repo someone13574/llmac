@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <functional>
 #include <span>
+#include <string_view>
 #include <vector>
 
 namespace ac {
@@ -30,7 +31,12 @@ struct Decoded {
 using GetProbs =
     std::function<std::vector<std::uint32_t>(std::span<const Symbol>)>;
 
-using OnSymbol = std::function<void(Symbol)>;
+struct Sink {
+    std::function<void(Symbol)> emit;
+    std::function<void(std::size_t)> rewind;
+    std::function<void()> commit;
+    std::function<void(std::string_view)> note;
+};
 
 struct BlockHooks {
     std::function<void()> save;
@@ -46,7 +52,7 @@ Decoded decode(
     std::uint32_t lattice,
     const GetProbs& prob_fn,
     const BlockHooks& hooks,
-    const OnSymbol& on_symbol
+    const Sink& sink
 );
 
 } // namespace ac
