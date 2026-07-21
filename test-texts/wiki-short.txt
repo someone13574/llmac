@@ -1,0 +1,6 @@
+The active stand test is a test that can measure orthostatic tachycardia (abnormally fast heart rate upon standing) and orthostatic hypotension (abnormally low blood pressure upon standing). It is used in the diagnosis of postural orthostatic tachycardia syndrome.
+First, individuals are asked to lie down for a period of 5 minutes, when heart rate and blood pressure are measured. If heart rate is high, that period is extended by another 5 minutes. Upon standing, heart rate and blood pressure are measured at fixed intervals (e.g. every minute for ten minutes, or immediately, at 3 minutes and at 10 minutes). Symptoms (e.g. dizziness) are recorded too. For the test, medication that can change heart rates are stopped before as appropriate. Compared to a tilt table test, there is typically a smaller increase in heart rate, and sometimes a repeat is necessary if POTS is highly suspected but the initial test did not clearly show POTS was present.
+The active stand test is similar the passive lean test, also called NASA Lean Test. In the passive lean test, individuals lean against a wall, which makes it easier for highly symptomatic or frail individuals. It is often used to test for orthostatic intolerance in ME/CFS.
+
+
+== References ==

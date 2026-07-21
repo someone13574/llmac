@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <format>
@@ -666,12 +667,13 @@ std::optional<Attempt> recover_block(
 
 } // namespace
 
-std::size_t encode(
+Encoded encode(
     std::span<const Symbol> seq,
     const GetProbs& prob_fn,
     const BitSink& sink
 ) {
     BitStream out(sink);
+    double ideal = 0.0;
 
     std::size_t offset = 0;
     while (offset < seq.size()) {
@@ -682,7 +684,12 @@ std::size_t encode(
         BlockEncoder coder(out);
         for (std::size_t idx = 0; idx < count; idx++) {
             std::vector<std::uint32_t> probs = prob_fn(seq.first(offset + idx));
-            coder.push(make_range(probs, block[idx]));
+            const SymbolRange range = make_range(probs, block[idx]);
+            ideal += std::log2(
+                static_cast<double>(range.total)
+                / static_cast<double>(range.high - range.low)
+            );
+            coder.push(range);
         }
         std::move(coder).finish();
 
@@ -707,7 +714,31 @@ std::size_t encode(
         offset += count;
     }
 
-    return out.bits();
+    return {.bits = out.bits(), .ideal_bits = ideal};
+}
+
+Encoded encode_raw(
+    std::span<const Symbol> seq,
+    const GetProbs& prob_fn,
+    const BitSink& sink
+) {
+    BitStream out(sink);
+    double ideal = 0.0;
+
+    BlockEncoder coder(out);
+    for (std::size_t idx = 0; idx < seq.size(); idx++) {
+        std::vector<std::uint32_t> probs = prob_fn(seq.first(idx));
+        const SymbolRange range = make_range(probs, seq[idx]);
+        ideal += std::log2(
+            static_cast<double>(range.total)
+            / static_cast<double>(range.high - range.low)
+        );
+        coder.push(range);
+    }
+    std::move(coder).finish();
+    out.flush();
+
+    return {.bits = out.bits(), .ideal_bits = ideal};
 }
 
 Decoded decode(
@@ -791,6 +822,47 @@ Decoded decode(
         pos = tail.end;
         block_index += 1;
     }
+}
+
+Decoded decode_raw(
+    std::span<const std::uint32_t> code,
+    std::size_t bits,
+    Symbol stop,
+    const GetProbs& prob_fn,
+    const Sink& sink
+) {
+    Decoded out;
+    BitReader reader(code, bits);
+
+    CoderState state;
+    state.value = reader.read_bits(32);
+
+    while (reader.position() <= bits + 64) {
+        const std::uint64_t range =
+            static_cast<std::uint64_t>(state.high) - state.low + 1;
+        std::vector<std::uint32_t> probs = prob_fn(out.symbols);
+        const Decision decision =
+            find_symbol(probs, state.value, state.low, range);
+
+        apply_symbol(state, decision.range, reader);
+        if (decision.range.symbol == stop) {
+            out.ok = true;
+            break;
+        }
+
+        out.symbols.push_back(decision.range.symbol);
+        if (sink.emit) {
+            sink.emit(decision.range.symbol);
+        }
+    }
+
+    if (!out.ok) {
+        note(sink, "error: no stop symbol before end of stream");
+    }
+    if (sink.commit) {
+        sink.commit();
+    }
+    return out;
 }
 
 } // namespace ac

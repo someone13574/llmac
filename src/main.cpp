@@ -215,7 +215,7 @@ std::optional<std::string> read_file(const char* path) {
     return content;
 }
 
-int encode_mode(std::string_view text, const char* model_path) {
+int encode_mode(std::string_view text, const char* model_path, bool raw) {
     llama_model* model = load_model(model_path);
     if (model == nullptr) {
         return 1;
@@ -306,24 +306,33 @@ int encode_mode(std::string_view text, const char* model_path) {
     };
 
     HexStream stream;
-    const std::size_t bits = ac::encode(seq, prob_fn, stream.sink());
+    const ac::Encoded encoded = raw
+                                  ? ac::encode_raw(seq, prob_fn, stream.sink())
+                                  : ac::encode(seq, prob_fn, stream.sink());
     stream.finish();
 
     if (text.empty()) {
-        std::println(stderr, "{} bits for {} tokens", bits, seq.size());
+        std::println(stderr, "{} bits for {} tokens", encoded.bits, seq.size());
     } else {
         std::println(
             stderr,
             "{} bits for {} tokens ({} bits of text, {:.2f}% compression)",
-            bits,
+            encoded.bits,
             seq.size(),
             text.size() * 8,
             100.0
                 * (1.0
-                   - static_cast<double>(bits)
+                   - static_cast<double>(encoded.bits)
                          / static_cast<double>(text.size() * 8))
         );
     }
+    std::println(
+        stderr,
+        "theoretical minimum {:.1f} bits ({:.2f}% coding overhead)",
+        encoded.ideal_bits,
+        100.0 * (static_cast<double>(encoded.bits) - encoded.ideal_bits)
+            / encoded.ideal_bits
+    );
 
     if (ctx != nullptr) {
         llama_free(ctx);
@@ -333,10 +342,10 @@ int encode_mode(std::string_view text, const char* model_path) {
     return 0;
 }
 
-int decode_mode(std::string_view raw, const char* model_path) {
+int decode_mode(std::string_view input, const char* model_path, bool raw) {
     std::string hex;
-    hex.reserve(raw.size());
-    for (char ch : raw) {
+    hex.reserve(input.size());
+    for (char ch : input) {
         if (std::isspace(static_cast<unsigned char>(ch)) == 0) {
             hex.push_back(ch);
         }
@@ -436,15 +445,22 @@ int decode_mode(std::string_view raw, const char* model_path) {
             },
     };
 
-    ac::Decoded decoded = ac::decode(
-        code,
-        payload_nibbles * 4,
-        static_cast<ac::Symbol>(eos),
-        quantize_step(n_vocab),
-        prob_fn,
-        hooks,
-        stream.sink()
-    );
+    ac::Decoded decoded = raw ? ac::decode_raw(
+                                    code,
+                                    payload_nibbles * 4,
+                                    static_cast<ac::Symbol>(eos),
+                                    prob_fn,
+                                    stream.sink()
+                                )
+                              : ac::decode(
+                                    code,
+                                    payload_nibbles * 4,
+                                    static_cast<ac::Symbol>(eos),
+                                    quantize_step(n_vocab),
+                                    prob_fn,
+                                    hooks,
+                                    stream.sink()
+                                );
 
     stream.finish();
 
@@ -468,13 +484,16 @@ int main(int argc, char** argv) {
     llama_log_set(quiet_log, nullptr);
 
     constexpr std::string_view usage =
-        "usage: llmac <encode|decode> [-f] [-m <path>] <input>\n"
+        "usage: llmac <encode|decode> [-f] [-r] [-m <path>] <input>\n"
         "  encode|decode        compress text to hex / hex back to text\n"
         "  -f, --file           read the input from the file at the given path\n"
+        "  -r, --raw            single unblocked stream, no error "
+        "detection/repair\n"
         "  -m, --model <path>   gguf model to use (default: "
         "models/Qwen3-0.6B-Q4_K_M.gguf)";
 
     bool from_file = false;
+    bool raw = false;
     const char* model_path = DEFAULT_MODEL_PATH;
     const char* mode_arg = nullptr;
     const char* input_arg = nullptr;
@@ -482,6 +501,8 @@ int main(int argc, char** argv) {
         const std::string_view arg = argv[idx];
         if (arg == "-f" || arg == "--file") {
             from_file = true;
+        } else if (arg == "-r" || arg == "--raw") {
+            raw = true;
         } else if (arg == "-m" || arg == "--model") {
             if (idx + 1 == argc) {
                 std::println(stderr, "{}", usage);
@@ -521,7 +542,7 @@ int main(int argc, char** argv) {
     }
 
     if (mode == "encode") {
-        return encode_mode(input, model_path);
+        return encode_mode(input, model_path, raw);
     }
-    return decode_mode(input, model_path);
+    return decode_mode(input, model_path, raw);
 }

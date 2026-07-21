@@ -23,6 +23,11 @@ struct Decoded {
     bool ok = false;
 };
 
+struct Encoded {
+    std::size_t bits = 0;
+    double ideal_bits = 0.0;
+};
+
 using GetProbs =
     std::function<std::vector<std::uint32_t>(std::span<const Symbol>)>;
 
@@ -43,7 +48,13 @@ struct BlockHooks {
     std::function<void()> restore;
 };
 
-std::size_t encode(
+Encoded encode(
+    std::span<const Symbol> seq,
+    const GetProbs& prob_fn,
+    const BitSink& sink
+);
+
+Encoded encode_raw(
     std::span<const Symbol> seq,
     const GetProbs& prob_fn,
     const BitSink& sink
@@ -56,6 +67,14 @@ Decoded decode(
     std::uint32_t lattice,
     const GetProbs& prob_fn,
     const BlockHooks& hooks,
+    const Sink& sink
+);
+
+Decoded decode_raw(
+    std::span<const std::uint32_t> code,
+    std::size_t bits,
+    Symbol stop,
+    const GetProbs& prob_fn,
     const Sink& sink
 );
 
