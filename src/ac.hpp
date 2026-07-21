@@ -18,11 +18,6 @@ constexpr std::size_t BLOCK = 256;
 
 using Symbol = std::uint32_t;
 
-struct Encoded {
-    std::vector<std::uint32_t> buffer;
-    std::size_t bits = 0;
-};
-
 struct Decoded {
     std::vector<Symbol> symbols;
     bool ok = false;
@@ -30,6 +25,11 @@ struct Decoded {
 
 using GetProbs =
     std::function<std::vector<std::uint32_t>(std::span<const Symbol>)>;
+
+struct BitSink {
+    std::function<void(std::uint32_t)> push;
+    std::function<void()> flush;
+};
 
 struct Sink {
     std::function<void(Symbol)> emit;
@@ -43,7 +43,11 @@ struct BlockHooks {
     std::function<void()> restore;
 };
 
-Encoded encode(std::span<const Symbol> seq, const GetProbs& prob_fn);
+std::size_t encode(
+    std::span<const Symbol> seq,
+    const GetProbs& prob_fn,
+    const BitSink& sink
+);
 
 Decoded decode(
     std::span<const std::uint32_t> code,

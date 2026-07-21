@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <print>
 #include <string>
@@ -30,6 +31,31 @@ std::size_t terminal_width() {
 }
 
 } // namespace
+
+ac::BitSink HexStream::sink() {
+    return {
+        .push = [this](std::uint32_t bit) { push(bit); },
+        .flush = [] { std::fflush(stdout); },
+    };
+}
+
+void HexStream::finish() {
+    while (held != 0) {
+        push(0);
+    }
+    std::println("");
+    std::fflush(stdout);
+}
+
+void HexStream::push(std::uint32_t bit) {
+    carry = (carry << 1) | (bit & 1U);
+    held += 1;
+    if (held == 4) {
+        std::print("{:x}", carry);
+        carry = 0;
+        held = 0;
+    }
+}
 
 TextStream::TextStream(Render render_)
     : render(std::move(render_)), interactive(isatty(STDOUT_FILENO) != 0),

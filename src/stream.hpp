@@ -1,12 +1,26 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <string>
 #include <string_view>
 #include <vector>
 
 #include "ac.hpp"
+
+class HexStream {
+  public:
+    [[nodiscard]] ac::BitSink sink();
+
+    void finish();
+
+  private:
+    void push(std::uint32_t bit);
+
+    std::uint32_t carry = 0;
+    std::size_t held = 0;
+};
 
 class TextStream {
   public:

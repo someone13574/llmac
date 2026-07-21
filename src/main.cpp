@@ -21,12 +21,12 @@
 
 namespace {
 
-constexpr const char* MODEL_PATH =
-    "models/HuggingFaceTB.SmolLM3-3B-Base.Q4_K_M.gguf";
-// constexpr const char* MODEL_PATH = "models/Qwen3-0.6B-Q4_K_M.gguf";
+// constexpr const char* MODEL_PATH =
+//     "models/HuggingFaceTB.SmolLM3-3B-Base.Q4_K_M.gguf";
+constexpr const char* MODEL_PATH = "models/Qwen3-0.6B-Q4_K_M.gguf";
 
 constexpr std::size_t WINDOW = 2048;
-constexpr std::size_t OVERLAP = 512;
+constexpr std::size_t OVERLAP = 128;
 
 constexpr std::size_t CHUNK = 512;
 
@@ -307,27 +307,22 @@ int encode_mode(std::string_view text) {
         return quantize(softmax_probs(eval->row(cursor++)));
     };
 
-    ac::Encoded encoded = ac::encode(seq, prob_fn);
+    HexStream stream;
+    const std::size_t bits = ac::encode(seq, prob_fn, stream.sink());
+    stream.finish();
 
-    const std::size_t payload_nibbles = (encoded.bits + 3) / 4;
-    for (std::size_t nibble = 0; nibble < payload_nibbles; nibble++) {
-        const std::uint32_t word = encoded.buffer[nibble / 8];
-        const unsigned shift = 28 - (4 * (nibble % 8));
-        std::print("{:x}", (word >> shift) & 0xFU);
-    }
-    std::println("");
     if (text.empty()) {
-        std::println(stderr, "{} bits for {} tokens", encoded.bits, seq.size());
+        std::println(stderr, "{} bits for {} tokens", bits, seq.size());
     } else {
         std::println(
             stderr,
             "{} bits for {} tokens ({} bits of text, {:.2f}% compression)",
-            encoded.bits,
+            bits,
             seq.size(),
             text.size() * 8,
             100.0
                 * (1.0
-                   - static_cast<double>(encoded.bits)
+                   - static_cast<double>(bits)
                          / static_cast<double>(text.size() * 8))
         );
     }

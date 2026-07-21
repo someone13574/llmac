@@ -1,7 +1,6 @@
 #include "ac.hpp"
 
 #include <algorithm>
-#include <array>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
@@ -26,7 +25,7 @@ void note(const Sink& sink, std::string_view message) {
     std::println(stderr, "{}", message);
 }
 
-constexpr std::size_t LEN_BITS = 16;
+constexpr std::size_t FLUSH_BITS = 2;
 constexpr std::size_t FINAL_CRC_BITS = 12;
 constexpr std::size_t CHECK_EVERY = 64;
 constexpr std::size_t CHECKS = (BLOCK / CHECK_EVERY) - 1;
@@ -48,17 +47,31 @@ std::uint32_t crc32(std::span<const Symbol> symbols) {
     return ~crc;
 }
 
-class BitWriter {
-    std::vector<std::uint32_t> words;
+std::size_t check_count(std::size_t count, bool final) {
+    if (!final) {
+        return CHECKS;
+    }
+    return count > CHECK_EVERY ? (count - 1) / CHECK_EVERY : 0;
+}
+
+class BitStream {
+    const BitSink& sink;
     std::size_t size = 0;
 
   public:
+    explicit BitStream(const BitSink& sink_) : sink(sink_) {}
+
     void push(std::uint32_t bit) {
-        if (size % 32 == 0) {
-            words.push_back(0);
+        if (sink.push) {
+            sink.push(bit & 1U);
         }
-        words[size / 32] |= (bit & 1U) << (31 - (size % 32));
         size += 1;
+    }
+
+    void flush() {
+        if (sink.flush) {
+            sink.flush();
+        }
     }
 
     void push_bits(std::uint32_t value, std::size_t count) {
@@ -67,18 +80,8 @@ class BitWriter {
         }
     }
 
-    void append(const BitWriter& other) {
-        for (std::size_t idx = 0; idx < other.size; idx++) {
-            push((other.words[idx / 32] >> (31 - (idx % 32))) & 1U);
-        }
-    }
-
     [[nodiscard]] std::size_t bits() const {
         return size;
-    }
-
-    Encoded finish() && {
-        return {.buffer = std::move(words), .bits = size};
     }
 };
 
@@ -142,19 +145,21 @@ SymbolRange make_range(std::span<const std::uint32_t> probs, Symbol symbol) {
 }
 
 class BlockEncoder {
+    BitStream& out;
     std::uint32_t low = 0;
     std::uint32_t high = static_cast<std::uint32_t>(WHOLE - 1);
     std::uint32_t pending = 0;
-    BitWriter writer;
 
     void emit(std::uint32_t bit) {
-        writer.push(bit);
+        out.push(bit);
         for (; pending > 0; pending--) {
-            writer.push(bit ^ 1U);
+            out.push(bit ^ 1U);
         }
     }
 
   public:
+    explicit BlockEncoder(BitStream& out_) : out(out_) {}
+
     void push(const SymbolRange& range) {
         std::uint64_t span = static_cast<std::uint64_t>(high) - low + 1;
         high = low + static_cast<std::uint32_t>(span * range.high / range.total)
@@ -181,10 +186,9 @@ class BlockEncoder {
         }
     }
 
-    BitWriter finish() && {
+    void finish() && {
         pending += 1;
         emit(low < QUARTER ? 0U : 1U);
-        return std::move(writer);
     }
 };
 
@@ -239,11 +243,8 @@ struct CoderState {
     std::uint32_t value = 0;
 };
 
-void apply_symbol(
-    CoderState& state,
-    const SymbolRange& sym,
-    BitReader& reader
-) {
+std::size_t
+apply_symbol(CoderState& state, const SymbolRange& sym, BitReader& reader) {
     std::uint64_t range =
         static_cast<std::uint64_t>(state.high) - state.low + 1;
     state.high = state.low
@@ -251,6 +252,7 @@ void apply_symbol(
     state.low =
         state.low + static_cast<std::uint32_t>(range * sym.low / sym.total);
 
+    std::size_t shifts = 0;
     while (true) {
         if (state.low >= HALF) {
             state.low -= HALF;
@@ -268,7 +270,9 @@ void apply_symbol(
         state.low = state.low << 1;
         state.high = (state.high << 1) | 1U;
         state.value = (state.value << 1) | reader.next();
+        shifts += 1;
     }
+    return shifts;
 }
 
 struct Tweak {
@@ -290,12 +294,7 @@ struct StepInfo {
 struct Attempt {
     std::vector<Symbol> symbols;
     bool found_stop = false;
-    std::size_t failed_check = SIZE_MAX;
-};
-
-struct BlockChecks {
-    std::array<std::uint32_t, CHECKS> expect {};
-    std::size_t count = 0;
+    std::size_t shifts = 0;
 };
 
 struct FirstPass {
@@ -326,31 +325,11 @@ SymbolRange tweaked_range(
     return sym;
 }
 
-std::optional<std::size_t> failed_checkpoint(
-    std::size_t step,
-    const BlockChecks& checks,
-    std::span<const Symbol> symbols
-) {
-    if (step % CHECK_EVERY != CHECK_EVERY - 1
-        || step / CHECK_EVERY >= checks.count) {
-        return std::nullopt;
-    }
-
-    const std::size_t check = step / CHECK_EVERY;
-    const std::uint32_t mask = (1U << CHECK_BITS) - 1U;
-    if ((crc32(symbols) & mask) == checks.expect[check]) {
-        return std::nullopt;
-    }
-    return check;
-}
-
 Attempt decode_block(
     BitReader& reader,
     std::size_t payload_pos,
     std::size_t bit_limit,
-    bool final,
     Symbol stop,
-    const BlockChecks& checks,
     const GetProbs& prob_fn,
     std::vector<Symbol>& context,
     std::span<const StepInfo> replay,
@@ -381,7 +360,7 @@ Attempt decode_block(
             };
             attempt.symbols.push_back(sym.symbol);
             context.push_back(sym.symbol);
-            apply_symbol(state, sym, reader);
+            attempt.shifts += apply_symbol(state, sym, reader);
             continue;
         }
 
@@ -410,7 +389,8 @@ Attempt decode_block(
         }
 
         attempt.symbols.push_back(sym.symbol);
-        if (final && sym.symbol == stop) {
+        if (sym.symbol == stop) {
+            attempt.shifts += apply_symbol(state, sym, reader);
             attempt.found_stop = true;
             return attempt;
         }
@@ -419,15 +399,8 @@ Attempt decode_block(
             sink->emit(sym.symbol);
         }
 
-        apply_symbol(state, sym, reader);
+        attempt.shifts += apply_symbol(state, sym, reader);
         if (reader.position() > bit_limit) {
-            return attempt;
-        }
-
-        const std::optional<std::size_t> failed =
-            failed_checkpoint(step, checks, attempt.symbols);
-        if (failed) {
-            attempt.failed_check = *failed;
             return attempt;
         }
     }
@@ -518,63 +491,91 @@ std::vector<std::vector<Tweak>> build_candidates(
     return candidates;
 }
 
-struct BlockLayout {
-    bool final = false;
-    std::size_t payload_pos = 0;
+struct BlockTail {
     std::size_t check_pos = 0;
-    std::size_t check_count = 0;
+    std::size_t checks = 0;
     std::size_t crc_pos = 0;
+    std::size_t crc_bits = 0;
+    std::size_t end = 0;
 };
 
-std::optional<BlockLayout>
-parse_layout(BitReader& reader, std::size_t pos, std::size_t bits) {
-    if (pos + 1 + FINAL_CRC_BITS > bits) {
-        return std::nullopt;
-    }
+BlockTail tail_at(std::size_t payload_end, const Attempt& attempt) {
+    BlockTail tail;
+    tail.checks = check_count(attempt.symbols.size(), attempt.found_stop);
+    tail.crc_bits = attempt.found_stop ? FINAL_CRC_BITS : 32;
 
-    reader.seek(pos);
-    BlockLayout layout;
-    layout.final = reader.read_bits(1) == 1;
-    layout.payload_pos = pos + 1;
-    if (layout.final) {
-        layout.check_count = reader.read_bits(2);
-        layout.payload_pos += 2;
-        layout.crc_pos = bits - FINAL_CRC_BITS;
-        layout.check_pos = layout.crc_pos - (layout.check_count * CHECK_BITS);
-        if (layout.check_pos < layout.payload_pos) {
-            return std::nullopt;
-        }
-        return layout;
-    }
+    const std::size_t width = (tail.checks * CHECK_BITS) + tail.crc_bits;
+    const std::size_t pad =
+        attempt.found_stop ? (4 - ((payload_end + width) % 4)) % 4 : 0;
 
-    const std::size_t len = reader.read_bits(LEN_BITS);
-    layout.payload_pos += LEN_BITS;
-    layout.check_pos = layout.payload_pos + len;
-    layout.check_count = CHECKS;
-    layout.crc_pos = layout.check_pos + (CHECKS * CHECK_BITS);
-    if (layout.crc_pos + 32 > bits) {
-        return std::nullopt;
-    }
-    return layout;
+    tail.check_pos = payload_end + pad;
+    tail.crc_pos = tail.check_pos + (tail.checks * CHECK_BITS);
+    tail.end = tail.crc_pos + tail.crc_bits;
+    return tail;
 }
 
-bool verify(
+BlockTail settled_tail(std::size_t payload_pos, const Attempt& attempt) {
+    return tail_at(payload_pos + attempt.shifts + FLUSH_BITS, attempt);
+}
+
+std::optional<BlockTail> confirm(
     BitReader& reader,
-    const BlockLayout& layout,
+    std::size_t payload_pos,
+    std::size_t bits,
     const Attempt& attempt
 ) {
-    if (layout.final && !attempt.found_stop) {
-        return false;
+    const BlockTail tail = settled_tail(payload_pos, attempt);
+
+    if (attempt.found_stop) {
+        if (tail.end != bits) {
+            return std::nullopt;
+        }
+        reader.seek(tail.crc_pos);
+        if (reader.read_bits(FINAL_CRC_BITS)
+            != (crc32(attempt.symbols) & 0xFFFU)) {
+            return std::nullopt;
+        }
+        return tail;
     }
-    reader.seek(layout.crc_pos);
-    if (layout.final) {
-        return reader.read_bits(FINAL_CRC_BITS)
-            == (crc32(attempt.symbols) & 0xFFFU);
+
+    if (attempt.symbols.size() != BLOCK || tail.end > bits) {
+        return std::nullopt;
     }
-    if (attempt.symbols.size() != BLOCK) {
-        return false;
+    reader.seek(tail.crc_pos);
+    if (reader.read_bits(32) != crc32(attempt.symbols)) {
+        return std::nullopt;
     }
-    return reader.read_bits(32) == crc32(attempt.symbols);
+    return tail;
+}
+
+std::size_t repair_window(
+    BitReader& reader,
+    std::size_t payload_pos,
+    std::size_t bits,
+    const Attempt& attempt
+) {
+    constexpr std::size_t SLACK = 8;
+
+    const BlockTail tail = settled_tail(payload_pos, attempt);
+    if (tail.crc_pos > bits) {
+        return 0;
+    }
+
+    const std::span<const Symbol> symbols(attempt.symbols);
+    const std::uint32_t mask = (1U << CHECK_BITS) - 1U;
+    reader.seek(tail.check_pos);
+    for (std::size_t check = 0; check < tail.checks; check++) {
+        const std::size_t upto = (check + 1) * CHECK_EVERY;
+        const std::uint32_t expect = reader.read_bits(CHECK_BITS);
+        if (upto > symbols.size()) {
+            break;
+        }
+        if ((crc32(symbols.first(upto)) & mask) != expect) {
+            const std::size_t window = check * CHECK_EVERY;
+            return window > SLACK ? window - SLACK : 0;
+        }
+    }
+    return 0;
 }
 
 void emit_all(const Sink& sink, const Attempt& attempt) {
@@ -590,9 +591,9 @@ void emit_all(const Sink& sink, const Attempt& attempt) {
 
 std::optional<Attempt> recover_block(
     BitReader& reader,
-    const BlockLayout& layout,
+    std::size_t payload_pos,
+    std::size_t bits,
     Symbol stop,
-    const BlockChecks& checks,
     std::uint32_t lattice,
     const GetProbs& prob_fn,
     const BlockHooks& hooks,
@@ -600,8 +601,9 @@ std::optional<Attempt> recover_block(
     std::vector<Symbol>& context,
     std::size_t base,
     const FirstPass& first,
-    std::size_t failed_check,
-    std::size_t block_index
+    std::size_t window_lo,
+    std::size_t block_index,
+    BlockTail& tail
 ) {
     if (sink.rewind) {
         sink.rewind(base);
@@ -614,13 +616,6 @@ std::optional<Attempt> recover_block(
         )
     );
 
-    constexpr std::size_t WINDOW_SLACK = 8;
-    std::size_t window_lo = 0;
-    if (failed_check != SIZE_MAX && failed_check > 0) {
-        const std::size_t window = failed_check * CHECK_EVERY;
-        window_lo = window > WINDOW_SLACK ? window - WINDOW_SLACK : 0;
-    }
-
     std::vector<std::vector<Tweak>> candidates =
         build_candidates(first.steps, lattice, first.vocab, window_lo);
     for (std::size_t idx = 0; idx < candidates.size(); idx++) {
@@ -630,11 +625,9 @@ std::optional<Attempt> recover_block(
         }
         Attempt retry = decode_block(
             reader,
-            layout.payload_pos,
-            layout.check_pos + 40,
-            layout.final,
+            payload_pos,
+            bits + 64,
             stop,
-            checks,
             prob_fn,
             context,
             first.steps,
@@ -642,7 +635,10 @@ std::optional<Attempt> recover_block(
             nullptr,
             nullptr
         );
-        if (verify(reader, layout, retry)) {
+        const std::optional<BlockTail> retry_tail =
+            confirm(reader, payload_pos, bits, retry);
+        if (retry_tail) {
+            tail = *retry_tail;
             note(
                 sink,
                 std::format(
@@ -670,8 +666,12 @@ std::optional<Attempt> recover_block(
 
 } // namespace
 
-Encoded encode(std::span<const Symbol> seq, const GetProbs& prob_fn) {
-    BitWriter out;
+std::size_t encode(
+    std::span<const Symbol> seq,
+    const GetProbs& prob_fn,
+    const BitSink& sink
+) {
+    BitStream out(sink);
 
     std::size_t offset = 0;
     while (offset < seq.size()) {
@@ -679,46 +679,35 @@ Encoded encode(std::span<const Symbol> seq, const GetProbs& prob_fn) {
         const bool final = offset + count == seq.size();
         std::span<const Symbol> block = seq.subspan(offset, count);
 
-        BlockEncoder coder;
+        BlockEncoder coder(out);
         for (std::size_t idx = 0; idx < count; idx++) {
             std::vector<std::uint32_t> probs = prob_fn(seq.first(offset + idx));
             coder.push(make_range(probs, block[idx]));
         }
-        BitWriter payload = std::move(coder).finish();
-        assert(payload.bits() < (UINT64_C(1) << LEN_BITS));
+        std::move(coder).finish();
 
-        out.push(final ? 1U : 0U);
+        const std::size_t checks = check_count(count, final);
+        const std::size_t crc_bits = final ? FINAL_CRC_BITS : 32;
+
         if (final) {
-            const std::size_t count_checks =
-                count > CHECK_EVERY ? (count - 1) / CHECK_EVERY : 0;
-            out.push_bits(static_cast<std::uint32_t>(count_checks), 2);
-            out.append(payload);
-            const std::size_t tail =
-                (count_checks * CHECK_BITS) + FINAL_CRC_BITS;
-            while ((out.bits() + tail) % 4 != 0) {
+            const std::size_t width = (checks * CHECK_BITS) + crc_bits;
+            while ((out.bits() + width) % 4 != 0) {
                 out.push(0);
             }
-            const std::uint32_t mask = (1U << CHECK_BITS) - 1U;
-            for (std::size_t check = 0; check < count_checks; check++) {
-                const std::size_t upto = (check + 1) * CHECK_EVERY;
-                out.push_bits(crc32(block.first(upto)) & mask, CHECK_BITS);
-            }
-            out.push_bits(crc32(block) & 0xFFFU, FINAL_CRC_BITS);
-        } else {
-            out.push_bits(static_cast<std::uint32_t>(payload.bits()), LEN_BITS);
-            out.append(payload);
-            const std::uint32_t mask = (1U << CHECK_BITS) - 1U;
-            for (std::size_t check = 0; check < CHECKS; check++) {
-                const std::size_t upto = (check + 1) * CHECK_EVERY;
-                out.push_bits(crc32(block.first(upto)) & mask, CHECK_BITS);
-            }
-            out.push_bits(crc32(block), 32);
         }
+
+        const std::uint32_t mask = (1U << CHECK_BITS) - 1U;
+        for (std::size_t check = 0; check < checks; check++) {
+            const std::size_t upto = (check + 1) * CHECK_EVERY;
+            out.push_bits(crc32(block.first(upto)) & mask, CHECK_BITS);
+        }
+        out.push_bits(crc32(block), crc_bits);
+        out.flush();
 
         offset += count;
     }
 
-    return std::move(out).finish();
+    return out.bits();
 }
 
 Decoded decode(
@@ -736,8 +725,7 @@ Decoded decode(
     std::size_t pos = 0;
     std::size_t block_index = 0;
     while (true) {
-        std::optional<BlockLayout> layout = parse_layout(reader, pos, bits);
-        if (!layout) {
+        if (pos + FINAL_CRC_BITS > bits) {
             note(
                 sink,
                 std::format("error: truncated stream at block {}", block_index)
@@ -750,21 +738,12 @@ Decoded decode(
             hooks.save();
         }
 
-        BlockChecks checks;
-        checks.count = layout->check_count;
-        reader.seek(layout->check_pos);
-        for (std::size_t check = 0; check < checks.count; check++) {
-            checks.expect[check] = reader.read_bits(CHECK_BITS);
-        }
-
         FirstPass first;
         Attempt attempt = decode_block(
             reader,
-            layout->payload_pos,
-            layout->check_pos + 40,
-            layout->final,
+            pos,
+            bits + 64,
             stop,
-            checks,
             prob_fn,
             out.symbols,
             {},
@@ -772,13 +751,17 @@ Decoded decode(
             &first,
             sink.emit ? &sink : nullptr
         );
+        std::optional<BlockTail> found = confirm(reader, pos, bits, attempt);
 
-        if (!verify(reader, *layout, attempt)) {
+        BlockTail tail;
+        if (found) {
+            tail = *found;
+        } else {
             std::optional<Attempt> repaired = recover_block(
                 reader,
-                *layout,
+                pos,
+                bits,
                 stop,
-                checks,
                 lattice,
                 prob_fn,
                 hooks,
@@ -786,8 +769,9 @@ Decoded decode(
                 out.symbols,
                 base,
                 first,
-                attempt.failed_check,
-                block_index
+                repair_window(reader, pos, bits, attempt),
+                block_index,
+                tail
             );
             if (!repaired) {
                 out.symbols.resize(base);
@@ -800,11 +784,11 @@ Decoded decode(
             sink.commit();
         }
 
-        if (layout->final) {
+        if (attempt.found_stop) {
             out.ok = true;
             return out;
         }
-        pos = layout->crc_pos + 32;
+        pos = tail.end;
         block_index += 1;
     }
 }
