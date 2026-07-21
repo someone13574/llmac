@@ -21,9 +21,7 @@
 
 namespace {
 
-// constexpr const char* MODEL_PATH =
-//     "models/HuggingFaceTB.SmolLM3-3B-Base.Q4_K_M.gguf";
-constexpr const char* MODEL_PATH = "models/Qwen3-0.6B-Q4_K_M.gguf";
+constexpr const char* DEFAULT_MODEL_PATH = "models/Qwen3-0.6B-Q4_K_M.gguf";
 
 constexpr std::size_t WINDOW = 2048;
 constexpr std::size_t OVERLAP = 128;
@@ -44,9 +42,9 @@ void quiet_log(
     }
 }
 
-llama_model* load_model() {
+llama_model* load_model(const char* path) {
     llama_model_params model_params = llama_model_default_params();
-    llama_model* model = llama_model_load_from_file(MODEL_PATH, model_params);
+    llama_model* model = llama_model_load_from_file(path, model_params);
     if (model == nullptr) {
         std::println(stderr, "error: unable to load model");
     }
@@ -217,8 +215,8 @@ std::optional<std::string> read_file(const char* path) {
     return content;
 }
 
-int encode_mode(std::string_view text) {
-    llama_model* model = load_model();
+int encode_mode(std::string_view text, const char* model_path) {
+    llama_model* model = load_model(model_path);
     if (model == nullptr) {
         return 1;
     }
@@ -335,7 +333,7 @@ int encode_mode(std::string_view text) {
     return 0;
 }
 
-int decode_mode(std::string_view raw) {
+int decode_mode(std::string_view raw, const char* model_path) {
     std::string hex;
     hex.reserve(raw.size());
     for (char ch : raw) {
@@ -362,7 +360,7 @@ int decode_mode(std::string_view raw) {
         code[nibble / 8] |= digit << (28 - (4 * (nibble % 8)));
     }
 
-    llama_model* model = load_model();
+    llama_model* model = load_model(model_path);
     if (model == nullptr) {
         return 1;
     }
@@ -470,31 +468,45 @@ int main(int argc, char** argv) {
     llama_log_set(quiet_log, nullptr);
 
     constexpr std::string_view usage =
-        "usage: llmac <encode|decode> [-f] <input>\n"
+        "usage: llmac <encode|decode> [-f] [-m <path>] <input>\n"
         "  encode|decode        compress text to hex / hex back to text\n"
-        "  -f, --file           read the input from the file at the given path";
-
-    if (argc < 3 || argc > 4) {
-        std::println(stderr, "{}", usage);
-        return 1;
-    }
-
-    const std::string_view mode = argv[1];
-    if (mode != "encode" && mode != "decode") {
-        std::println(stderr, "{}", usage);
-        return 1;
-    }
+        "  -f, --file           read the input from the file at the given path\n"
+        "  -m, --model <path>   gguf model to use (default: "
+        "models/Qwen3-0.6B-Q4_K_M.gguf)";
 
     bool from_file = false;
-    const char* input_arg = argv[2];
-    if (argc == 4) {
-        const std::string_view flag = argv[2];
-        if (flag != "-f" && flag != "--file") {
+    const char* model_path = DEFAULT_MODEL_PATH;
+    const char* mode_arg = nullptr;
+    const char* input_arg = nullptr;
+    for (int idx = 1; idx < argc; idx++) {
+        const std::string_view arg = argv[idx];
+        if (arg == "-f" || arg == "--file") {
+            from_file = true;
+        } else if (arg == "-m" || arg == "--model") {
+            if (idx + 1 == argc) {
+                std::println(stderr, "{}", usage);
+                return 1;
+            }
+            model_path = argv[++idx];
+        } else if (mode_arg == nullptr) {
+            mode_arg = argv[idx];
+        } else if (input_arg == nullptr) {
+            input_arg = argv[idx];
+        } else {
             std::println(stderr, "{}", usage);
             return 1;
         }
-        from_file = true;
-        input_arg = argv[3];
+    }
+
+    if (mode_arg == nullptr || input_arg == nullptr) {
+        std::println(stderr, "{}", usage);
+        return 1;
+    }
+
+    const std::string_view mode = mode_arg;
+    if (mode != "encode" && mode != "decode") {
+        std::println(stderr, "{}", usage);
+        return 1;
     }
 
     std::string input;
@@ -509,7 +521,7 @@ int main(int argc, char** argv) {
     }
 
     if (mode == "encode") {
-        return encode_mode(input);
+        return encode_mode(input, model_path);
     }
-    return decode_mode(input);
+    return decode_mode(input, model_path);
 }
